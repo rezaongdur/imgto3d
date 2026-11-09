@@ -37,5 +37,50 @@ python -m venv venv
 pip install --upgrade pip
 pip install -r requirements.txt
 
+A. Contoh Perintah Eksekusi CLI
+**Skenario 1: Mode A (Presisi CAD / Ortografis) — Denah atau Komponen Mekanikal**
+Misalkan pada gambar denah_lantai1.png, dinding sepanjang $6.0\text{ meter}$ terukur sepanjang $1200\text{ piksel}$, dan Anda ingin mengekstrusi dinding setinggi $3.5\text{ meter}$ siap import ke SketchUp:Bash : 
+
+python img2mesh_pipeline.py \
+  --input denah_lantai1.png \
+  --output-dir ./hasil_cad \
+  --mode cad \
+  --ref-real-size 6.0 \
+  --ref-pixels 1200 \
+  --unit m \
+  --extrude-height 3.5 \
+  --rdp-epsilon 0.25
+
+  **Skenario 2: Mode A Multi-File** — Penumpukan Layer Bertingkat (Stacked Assembly)Menggabungkan 3 irisan gambar (base_plate.png, mid_wall.png, top_flange.png) menjadi satu rakitan CAD solid 3D berurutan pada sumbu $Z$:
+  
+  python img2mesh_pipeline.py \
+  --input base_plate.png mid_wall.png top_flange.png \
+  --output-dir ./hasil_assembly \
+  --mode cad \
+  --multi-strategy stack \
+  --ref-real-size 50.0 \
+  --ref-pixels 400 \
+  --unit mm \
+  --extrude-height 4.0
+
+  **Skenario 3: Mode B (Presisi Permukaan / Relief & Objek 3D) ** — Foto TunggalMengonversi foto objek/relief ukiran_kayu.jpg menggunakan Depth Anything V2 dan Screened Poisson Surface Reconstruction dengan alas tertutup (watertight) setebal $15\text{ mm}$:
+
+  python img2mesh_pipeline.py \
+  --input ukiran_kayu.jpg \
+  --output-dir ./hasil_relief \
+  --mode surface \
+  --depth-backend depth-anything \
+  --surface-method poisson \
+  --poisson-depth 9 \
+  --ref-real-size 200.0 \
+  --ref-pixels 1024 \
+  --unit mm \
+  --extrude-height 15.0
+
+B. **Catatan Rekayasa & Kalibrasi Presisi**
+
+- Integrasi Langsung ke SketchUp (.DAE): Modul _export_sketchup_collada menyuntikkan elemen <unit name="millimeter" meter="0.001"/> (atau sentimeter/meter sesuai argumen --unit) dan <up_axis>Z_UP</up_axis>. Saat diimpor ke SketchUp (File → Import → COLLADA), sumbu X–Y akan sejajar sempurna dengan bidang tanah (Red–Green plane) dan ketinggian ekstrusi menghadap lurus ke sumbu biru (+Z) dengan rasio dimensi 1:1.
+	Pemilihan Nilai ϵ Ramer-Douglas-Peucker (--rdp-epsilon): Untuk gambar beresolusi tinggi (lebih dari 2000" px" ) dengan kurva melengkung atau lingkaran CAD, pertahankan --rdp-epsilon di rentang 0.20 hingga 0.40 piksel agar busur tetap mulus tanpa faset poligonal kasar.
+	Koreksi Polaritas Binarization (--invert): Secara bawaan, Mode A mengasumsikan garis/objek berwarna gelap di atas latar belakang terang (seperti gambar teknik/denah putih). Gunakan flag --invert apabila objek target berwarna putih/terang di atas latar belakang gelap.
 
 
