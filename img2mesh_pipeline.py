@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 End-to-End 2D Image(s) to Calibrated 3D Solid Mesh Reconstruction Pipeline
-(Dilengkapi Kalibrasi Intrinsik Kamera & Koreksi Perspektif Homografi 4-Titik).
+(Dilengkapi Kalibrasi Intrinsik Kamera, Homografi 4-Titik, & Open3D Interactive Preview).
 
 Tahapan Pipeline:
   - Tahap 0A: Kalibrasi & Undistorsi Matriks Intrinsik Kamera (Brown-Conrady / Zhang)
@@ -11,7 +11,7 @@ Tahapan Pipeline:
               Mode B (Depth Anything V2 / MiDaS / Heightmap + Poisson / Alpha Shapes)
   - Tahap 3 : Mesh Cleaning & Topology Optimization (Watertight, Manifold, Taubin)
   - Tahap 4 : Ekspor Multi-Format (.STL, .OBJ + .MTL, .DAE Z-up SketchUp, .PLY)
-  - Tahap 5 : Validasi Dimensi Fisik & Integritas Topologi Euler
+  - Tahap 5 : Validasi Dimensi Fisik, Integritas Topologi Euler, & Pratinjau 3D Open3D
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import argparse
 import glob
 import json
 import logging
+import math
+import os
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -148,7 +150,6 @@ class HomographyConfig:
             )
         if self.rect_real_width <= 0.0 or self.rect_real_height <= 0.0:
             raise CalibrationError("Dimensi fisik referensi homografi (width & height) harus > 0.")
-        # Validasi bahwa keempat titik membentuk segi empat konveks non-degenerasi
         area = cv2.contourArea(self.src_points)
         if area < 100.0:
             raise CalibrationError(
@@ -185,6 +186,19 @@ class CalibrationConfig:
     def meters_per_unit(self) -> float:
         """Konversi unit ke meter untuk metadata COLLADA (.DAE)."""
         return {"mm": 0.001, "cm": 0.01, "m": 1.0}[self.unit]
+
+
+@dataclass
+class PreviewConfig:
+    """Konfigurasi pratinjau interaktif Open3D Visualizer pada tahap validasi akhir."""
+
+    enabled: bool = False
+    wireframe: bool = False
+    show_back_face: bool = True
+    show_guides: bool = True
+    confirm_before_export: bool = False
+    window_width: int = 1280
+    window_height: int = 800
 
 
 @dataclass
@@ -227,6 +241,8 @@ class PipelineConfig:
     taubin_iterations: int = 5
     target_reduction: float = 0.0
     enforce_watertight: bool = True
+    # Tahap 5: Interactive Preview
+    preview: PreviewConfig = field(default_factory=PreviewConfig)
 
 
 @dataclass
@@ -267,11 +283,6 @@ class CameraIntrinsicsCalibrator:
         square_size: float,
         save_path: Path,
     ) -> CameraIntrinsicsConfig:
-        """
-        Menghitung matriks intrinsik K dan koefisien distorsi dari sekumpulan
-        citra kalibrasi papan catur.
-        board_size: (jumlah_sudut_dalam_kolom, jumlah_sudut_dalam_baris), mis. (9, 6).
-        """
         if square_size <= 0:
             raise CalibrationError("square_size papan catur harus lebih besar dari 0.")
 
@@ -336,10 +347,6 @@ class CameraIntrinsicsCalibrator:
     def undistort_image(
         img_bgr: np.ndarray, intrinsics: CameraIntrinsicsConfig
     ) -> np.ndarray:
-        """
-        Menghilangkan distorsi lensa dengan penskalaan otomatis matriks K jika
-        resolusi citra berbeda dari resolusi saat kalibrasi.
-        """
         h, w = img_bgr.shape[:2]
         k_mat = intrinsics.camera_matrix.copy()
 
@@ -381,17 +388,18 @@ class HomographyPerspectiveRectifier:
     """
 
     @staticmethod
-    def interactive_pick_4_points(img_bgr: np.ndarray, window_title: str = "Pilih 4 Sudut Referensi (TL -> TR -> BR -> BL)") -> np.ndarray:
-        """
-        Membuka jendela interaktif OpenCV agar pengguna dapat mengklik 4 sudut
-        bidang referensi secara berurutan: Kiri-Atas, Kanan-Atas, Kanan-Bawah, Kiri-Bawah.
-        """
+    def interactive_pick_4_points(
+        img_bgr: np.ndarray,
+        window_title: str = "Pilih 4 Sudut Referensi (TL -> TR -> BR -> BL)",
+    ) -> np.ndarray:
         display = img_bgr.copy()
         h, w = display.shape[:2]
         max_disp = 1200.0
         disp_scale = min(1.0, max_disp / float(max(h, w)))
         if disp_scale < 1.0:
-            display = cv2.resize(display, (int(w * disp_scale), int(h * disp_scale)), interpolation=cv2.INTER_AREA)
+            display = cv2.resize(
+                display, (int(w * disp_scale), int(h * disp_scale)), interpolation=cv2.INTER_AREA
+            )
 
         clicked: List[Tuple[float, float]] = []
         labels = ["1: Top-Left", "2: Top-Right", "3: Bottom-Right", "4: Bottom-Left"]
@@ -424,11 +432,13 @@ class HomographyPerspectiveRectifier:
             cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
             cv2.setMouseCallback(window_title, on_mouse)
             cv2.imshow(window_title, display)
-            logger.info("Klik 4 sudut referensi pada jendela gambar (TL -> TR -> BR -> BL), lalu tekan tombol apa saja.")
+            logger.info(
+                "Klik 4 sudut referensi pada jendela gambar (TL -> TR -> BR -> BL), lalu tekan tombol apa saja."
+            )
 
             while True:
                 key = cv2.waitKey(30) & 0xFF
-                if key == 27:  # ESC
+                if key == 27:
                     raise CalibrationError("Pemilihan 4 titik homografi dibatalkan pengguna (ESC).")
                 if len(clicked) == 4 and key != 255:
                     break
@@ -448,14 +458,7 @@ class HomographyPerspectiveRectifier:
     def rectify(
         img_bgr: np.ndarray, h_cfg: HomographyConfig
     ) -> Tuple[np.ndarray, float, np.ndarray]:
-        """
-        Menerapkan koreksi perspektif homografi 4-titik dan mengembalikan:
-          1. Citra hasil rektifikasi ortografis (img_rectified)
-          2. Faktor skala metrik baru (scale_per_pixel = 1.0 / pixels_per_unit)
-          3. Matriks homografi 3x3 akhir yang diterapkan
-        """
         src = h_cfg.src_points
-        # Hitung panjang piksel tepi atas/bawah dan kiri/kanan untuk menentukan kerapatan piksel optimal
         top_w_px = float(np.linalg.norm(src[1] - src[0]))
         bot_w_px = float(np.linalg.norm(src[2] - src[3]))
         left_h_px = float(np.linalg.norm(src[3] - src[0]))
@@ -496,7 +499,6 @@ class HomographyPerspectiveRectifier:
             )
             final_h = h_mat
         else:
-            # Proyeksikan keempat sudut kanvas citra asli agar seluruh denah/objek tetap utuh
             ih, iw = img_bgr.shape[:2]
             canvas_corners = np.array(
                 [[[0.0, 0.0]], [[iw, 0.0]], [[iw, ih]], [[0.0, ih]]],
@@ -509,7 +511,6 @@ class HomographyPerspectiveRectifier:
             out_w = int(max_xy[0] - min_xy[0])
             out_h = int(max_xy[1] - min_xy[1])
 
-            # Guardrail memori apabila sudut kamera terlalu ekstrem (grazing angle)
             if out_w > 12000 or out_h > 12000 or out_w <= 0 or out_h <= 0:
                 raise CalibrationError(
                     f"Ukuran kanvas hasil homografi full-canvas tidak wajar ({out_w}x{out_h} px). "
@@ -559,10 +560,6 @@ class ImagePreprocessor:
         self.cfg = config
 
     def load_and_rectify_image(self, image_path: Path) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Memuat citra BGR, menerapkan undistorsi matriks intrinsik kamera (jika ada),
-        dan menerapkan koreksi perspektif homografi 4-titik (jika ada).
-        """
         if not image_path.exists() or not image_path.is_file():
             raise FileNotFoundError(f"File citra tidak ditemukan: {image_path}")
 
@@ -570,7 +567,6 @@ class ImagePreprocessor:
         if img_bgr is None:
             raise PipelineError(f"Gagal mendekode citra (format korup/tidak didukung): {image_path}")
 
-        # Tangani citra RGBA (misalnya logo PNG dengan latar transparan)
         if img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
             alpha = img_bgr[:, :, 3:4].astype(np.float32) / 255.0
             bgr = img_bgr[:, :, :3].astype(np.float32)
@@ -579,12 +575,10 @@ class ImagePreprocessor:
         elif img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
 
-        # Tahap 0A: Koreksi distorsi lensa menggunakan matriks intrinsik kamera
         if self.cfg.camera_intrinsics is not None:
             logger.info("Menerapkan koreksi distorsi lensa dari matriks intrinsik kamera...")
             img_bgr = CameraIntrinsicsCalibrator.undistort_image(img_bgr, self.cfg.camera_intrinsics)
 
-        # Tahap 0B: Koreksi perspektif homografi 4-titik & sinkronisasi skala 1:1
         if self.cfg.homography is not None:
             if self.cfg.interactive_pick_points:
                 picked = HomographyPerspectiveRectifier.interactive_pick_4_points(img_bgr)
@@ -593,7 +587,6 @@ class ImagePreprocessor:
             img_bgr, new_scale_per_px, _ = HomographyPerspectiveRectifier.rectify(
                 img_bgr, self.cfg.homography
             )
-            # Perbarui skala kalibrasi secara otomatis agar 100% sinkron dengan hasil homografi
             self.cfg.calibration.ref_real_size = new_scale_per_px
             self.cfg.calibration.ref_pixels = 1.0
 
@@ -601,10 +594,6 @@ class ImagePreprocessor:
         return img_bgr, img_rgb
 
     def enhance_and_denoise(self, img_bgr: np.ndarray) -> np.ndarray:
-        """
-        Menerapkan CLAHE pada kanal luminansi L* (CIE Lab) dilanjutkan
-        dengan Bilateral Filtering untuk meredam noise tanpa mengaburkan tepi tajam.
-        """
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
         l_chan, a_chan, b_chan = cv2.split(lab)
 
@@ -624,10 +613,6 @@ class ImagePreprocessor:
         return denoised
 
     def binarize_high_precision(self, denoised_gray: np.ndarray) -> np.ndarray:
-        """
-        Menghasilkan mask biner bersih (0 atau 255) dengan sub-pixel morphological
-        conditioning untuk ekstraksi kontur CAD presisi tinggi.
-        """
         if self.cfg.use_otsu:
             thresh_type = (
                 cv2.THRESH_BINARY if self.cfg.calibration.invert_polarity else cv2.THRESH_BINARY_INV
@@ -1127,6 +1112,11 @@ class MeshTopologyOptimizer:
         if final_tm.is_watertight and final_tm.volume < 0:
             final_tm.invert()
 
+        # Sinkronkan kembali normal dan orientasi segitiga final ke o3d_mesh untuk pratinjau & PLY
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(final_tm.vertices, dtype=np.float64))
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(final_tm.faces, dtype=np.int32))
+        o3d_mesh.compute_vertex_normals()
+
         return final_tm, o3d_mesh
 
 
@@ -1265,8 +1255,219 @@ class MultiFormatMeshExporter:
 
 
 # ==============================================================================
-# TAHAP 5: VALIDASI GEOMETRIS & TOPOLOGIS
+# TAHAP 5: VALIDASI GEOMETRIS, TOPOLOGIS, & PRATINJAU INTERAKTIF OPEN3D
 # ==============================================================================
+
+
+class InteractiveMeshPreviewer:
+    """
+    Menyediakan inspeksi visual 3D interaktif menggunakan Open3D Visualizer
+    dengan overlay sumbu koordinat metrik, bounding box, dan grid bidang dasar Z=0.
+    """
+
+    @staticmethod
+    def _has_display_server() -> bool:
+        if sys.platform.startswith("linux"):
+            return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        return True
+
+    @staticmethod
+    def _build_ground_grid(
+        min_bound: np.ndarray, max_bound: np.ndarray
+    ) -> o3d.geometry.LineSet:
+        """Membangun LineSet grid referensi pada bidang Z = 0."""
+        span_x = max(float(max_bound[0] - min_bound[0]), 1.0)
+        span_y = max(float(max_bound[1] - min_bound[1]), 1.0)
+        max_span = max(span_x, span_y)
+
+        # Pilih interval grid kelipatan 1, 2, atau 5 berbasis pangkat 10
+        raw_step = max_span / 10.0
+        magnitude = 10.0 ** math.floor(math.log10(max(raw_step, 1e-6)))
+        residual = raw_step / magnitude
+        if residual <= 1.5:
+            step = 1.0 * magnitude
+        elif residual <= 3.5:
+            step = 2.0 * magnitude
+        elif residual <= 7.5:
+            step = 5.0 * magnitude
+        else:
+            step = 10.0 * magnitude
+
+        pad = step * 1.0
+        x0 = math.floor((min_bound[0] - pad) / step) * step
+        x1 = math.ceil((max_bound[0] + pad) / step) * step
+        y0 = math.floor((min_bound[1] - pad) / step) * step
+        y1 = math.ceil((max_bound[1] + pad) / step) * step
+
+        xs = np.arange(x0, x1 + step * 0.5, step)
+        ys = np.arange(y0, y1 + step * 0.5, step)
+
+        points: List[List[float]] = []
+        lines: List[List[int]] = []
+
+        for x in xs:
+            idx = len(points)
+            points.append([float(x), float(y0), 0.0])
+            points.append([float(x), float(y1), 0.0])
+            lines.append([idx, idx + 1])
+
+        for y in ys:
+            idx = len(points)
+            points.append([float(x0), float(y), 0.0])
+            points.append([float(x1), float(y), 0.0])
+            lines.append([idx, idx + 1])
+
+        grid = o3d.geometry.LineSet()
+        grid.points = o3d.utility.Vector3dVector(np.array(points, dtype=np.float64))
+        grid.lines = o3d.utility.Vector2iVector(np.array(lines, dtype=np.int32))
+        grid.paint_uniform_color([0.32, 0.35, 0.40])
+        return grid
+
+    @classmethod
+    def show(
+        cls,
+        o3d_mesh: o3d.geometry.TriangleMesh,
+        report: ValidationReport,
+        preview_cfg: PreviewConfig,
+        output_dir: Path,
+    ) -> bool:
+        """
+        Membuka jendela pratinjau Open3D interaktif.
+        Mengembalikan True apabila ekspor disetujui/dilanjutkan, atau False jika dibatalkan.
+        """
+        if not cls._has_display_server():
+            logger.warning(
+                "Lingkungan headless terdeteksi (tidak ada DISPLAY/WAYLAND_DISPLAY). "
+                "Pratinjau 3D Open3D dilewati."
+            )
+            return True
+
+        u = report.unit
+        status_wt = "WATERTIGHT" if report.is_watertight else "OPEN MESH"
+        win_title = (
+            f"Img2Mesh3D Validator | {report.model_name} | "
+            f"{report.length_x:.2f}x{report.width_y:.2f}x{report.height_z:.2f} {u} | "
+            f"{report.num_faces:,} tris [{status_wt}]"
+        )
+
+        print("  Kontrol Pratinjau 3D Open3D:")
+        print("    [Mouse Kiri] Rotasi  | [Scroll] Zoom  | [Mouse Tengah/Shift+Drag] Pan")
+        print("    [W] Toggle Wireframe | [B] Toggle Back-Face | [G] Toggle Grid & Sumbu XYZ")
+        print("    [R] Reset Kamera     | [S] Simpan Screenshot PNG | [Q / ESC] Tutup Pratinjau\n")
+
+        # Siapkan geometri diagnostik
+        max_dim = max(report.length_x, report.width_y, report.height_z, 1.0)
+        axis_size = max_dim * 0.18
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_size, origin=[0.0, 0.0, 0.0]
+        )
+
+        aabb = o3d_mesh.get_axis_aligned_bounding_box()
+        aabb.color = (0.0, 0.85, 1.0)
+
+        min_b = np.asarray(aabb.min_bound)
+        max_b = np.asarray(aabb.max_bound)
+        ground_grid = cls._build_ground_grid(min_b, max_b)
+
+        state = {
+            "wireframe": preview_cfg.wireframe,
+            "back_face": preview_cfg.show_back_face,
+            "guides": preview_cfg.show_guides,
+            "screenshot_idx": 1,
+        }
+
+        try:
+            vis = o3d.visualization.VisualizerWithKeyCallback()
+            created = vis.create_window(
+                window_name=win_title,
+                width=preview_cfg.window_width,
+                height=preview_cfg.window_height,
+            )
+            if not created:
+                logger.warning("Gagal menginisialisasi konteks OpenGL Open3D. Pratinjau dilewati.")
+                return True
+
+            vis.add_geometry(o3d_mesh)
+            if state["guides"]:
+                vis.add_geometry(coord_frame)
+                vis.add_geometry(aabb)
+                vis.add_geometry(ground_grid)
+
+            render_opt = vis.get_render_option()
+            render_opt.background_color = np.array([0.11, 0.12, 0.15], dtype=np.float64)
+            render_opt.mesh_show_wireframe = state["wireframe"]
+            render_opt.mesh_show_back_face = state["back_face"]
+            render_opt.light_on = True
+
+            # Atur sudut pandang isometrik awal menghadap +Z dari kuadran depan-kanan
+            ctr = vis.get_view_control()
+            ctr.set_front([0.55, -0.65, 0.52])
+            ctr.set_up([0.0, 0.0, 1.0])
+            ctr.set_lookat(aabb.get_center())
+            ctr.set_zoom(0.75)
+
+            def toggle_wireframe(v: o3d.visualization.Visualizer) -> bool:
+                state["wireframe"] = not state["wireframe"]
+                v.get_render_option().mesh_show_wireframe = state["wireframe"]
+                logger.info("Preview Wireframe: %s", "ON" if state["wireframe"] else "OFF")
+                return False
+
+            def toggle_backface(v: o3d.visualization.Visualizer) -> bool:
+                state["back_face"] = not state["back_face"]
+                v.get_render_option().mesh_show_back_face = state["back_face"]
+                logger.info("Preview Back-Face: %s", "ON" if state["back_face"] else "OFF")
+                return False
+
+            def toggle_guides(v: o3d.visualization.Visualizer) -> bool:
+                state["guides"] = not state["guides"]
+                if state["guides"]:
+                    v.add_geometry(coord_frame, reset_bounding_box=False)
+                    v.add_geometry(aabb, reset_bounding_box=False)
+                    v.add_geometry(ground_grid, reset_bounding_box=False)
+                else:
+                    v.remove_geometry(coord_frame, reset_bounding_box=False)
+                    v.remove_geometry(aabb, reset_bounding_box=False)
+                    v.remove_geometry(ground_grid, reset_bounding_box=False)
+                logger.info("Preview Diagnostic Guides: %s", "ON" if state["guides"] else "OFF")
+                return False
+
+            def save_screenshot(v: o3d.visualization.Visualizer) -> bool:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                shot_path = output_dir / f"{report.model_name}_preview_{state['screenshot_idx']}.png"
+                v.capture_screen_image(str(shot_path), do_render=True)
+                logger.info("Screenshot pratinjau disimpan ke: %s", shot_path.resolve())
+                state["screenshot_idx"] += 1
+                return False
+
+            def reset_camera(v: o3d.visualization.Visualizer) -> bool:
+                v.reset_view_point(True)
+                return False
+
+            vis.register_key_callback(ord("W"), toggle_wireframe)
+            vis.register_key_callback(ord("B"), toggle_backface)
+            vis.register_key_callback(ord("G"), toggle_guides)
+            vis.register_key_callback(ord("S"), save_screenshot)
+            vis.register_key_callback(ord("R"), reset_camera)
+
+            vis.run()
+            vis.destroy_window()
+
+        except Exception as exc:
+            logger.warning("Terjadi kendala pada jendela Open3D Visualizer: %s", exc)
+            return True
+
+        if preview_cfg.confirm_before_export:
+            try:
+                ans = input(
+                    f"Lanjutkan ekspor file 3D untuk '{report.model_name}' ke disk? [Y/n]: "
+                ).strip().lower()
+                if ans in ("n", "no", "tidak"):
+                    logger.warning("Ekspor file untuk '%s' dibatalkan oleh pengguna.", report.model_name)
+                    return False
+            except EOFError:
+                return True
+
+        return True
 
 
 class MeshValidator:
@@ -1278,7 +1479,7 @@ class MeshValidator:
         mesh: trimesh.Trimesh,
         o3d_mesh: o3d.geometry.TriangleMesh,
         unit: str,
-        exported_files: Dict[str, Path],
+        exported_files: Optional[Dict[str, Path]] = None,
     ) -> ValidationReport:
         extents = mesh.extents
         is_wt = bool(mesh.is_watertight)
@@ -1298,7 +1499,7 @@ class MeshValidator:
             is_edge_manifold=bool(o3d_mesh.is_edge_manifold(allow_boundary_edges=False)),
             is_vertex_manifold=bool(o3d_mesh.is_vertex_manifold()),
             is_winding_consistent=bool(mesh.is_winding_consistent),
-            exported_files=exported_files,
+            exported_files=exported_files or {},
         )
 
     @staticmethod
@@ -1318,10 +1519,11 @@ class MeshValidator:
         print(f"  Edge Manifold             : {'YA' if report.is_edge_manifold else 'TIDAK'}")
         print(f"  Vertex Manifold           : {'YA' if report.is_vertex_manifold else 'TIDAK'}")
         print(f"  Normal Winding Consistent : {'YA' if report.is_winding_consistent else 'TIDAK'}")
-        print("-" * 72)
-        print("  File Output Terealisasi:")
-        for fmt, path in report.exported_files.items():
-            print(f"    [{fmt:<3}] -> {path.resolve()}")
+        if report.exported_files:
+            print("-" * 72)
+            print("  File Output Terealisasi:")
+            for fmt, path in report.exported_files.items():
+                print(f"    [{fmt:<3}] -> {path.resolve()}")
         print(f"{border}\n")
 
 
@@ -1432,15 +1634,40 @@ class ImageTo3DPipeline:
 
     def _finalize_and_export(self, raw_mesh: trimesh.Trimesh, base_name: str) -> ValidationReport:
         clean_tm, clean_o3d = self.optimizer.clean_and_optimize(raw_mesh)
-        exported_files = self.exporter.export_all(clean_tm, clean_o3d, base_name)
+
+        # Audit geometri & topologi sebelum/sesudah ekspor
         report = MeshValidator.validate(
             model_name=base_name,
             mesh=clean_tm,
             o3d_mesh=clean_o3d,
             unit=self.cfg.calibration.unit,
-            exported_files=exported_files,
         )
+
+        # Jika mode gerbang konfirmasi aktif, tampilkan pratinjau Open3D sebelum menulis file
+        if self.cfg.preview.enabled and self.cfg.preview.confirm_before_export:
+            MeshValidator.print_report(report)
+            approved = InteractiveMeshPreviewer.show(
+                o3d_mesh=clean_o3d,
+                report=report,
+                preview_cfg=self.cfg.preview,
+                output_dir=self.cfg.output_dir,
+            )
+            if not approved:
+                return report
+
+        exported_files = self.exporter.export_all(clean_tm, clean_o3d, base_name)
+        report.exported_files = exported_files
         MeshValidator.print_report(report)
+
+        # Pratinjau interaktif standar setelah validasi & ekspor selesai
+        if self.cfg.preview.enabled and not self.cfg.preview.confirm_before_export:
+            InteractiveMeshPreviewer.show(
+                o3d_mesh=clean_o3d,
+                report=report,
+                preview_cfg=self.cfg.preview,
+                output_dir=self.cfg.output_dir,
+            )
+
         return report
 
 
@@ -1475,7 +1702,6 @@ def resolve_input_files(raw_inputs: Sequence[str]) -> List[Path]:
 
 
 def parse_points_string(pts_str: str) -> np.ndarray:
-    """Mengurai format titik 'x1,y1;x2,y2;x3,y3;x4,y4' menjadi array (4, 2)."""
     pairs = [seg.strip() for seg in pts_str.split(";") if seg.strip()]
     if len(pairs) != 4:
         raise CalibrationError(
@@ -1499,7 +1725,7 @@ def parse_wx_h(size_str: str, sep: str = "x") -> Tuple[float, float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Konversi Presisi Tinggi Gambar 2D ke Model 3D dengan Kalibrasi Intrinsik & Homografi 4-Titik",
+        description="Konversi Presisi Tinggi Gambar 2D ke Model 3D dengan Kalibrasi Intrinsik, Homografi, & Open3D Preview",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1564,6 +1790,24 @@ def main() -> int:
         "--homography-crop",
         action="store_true",
         help="Potong output hanya di dalam area 4 titik (default: pertahankan seluruh kanvas)",
+    )
+
+    # --- Sub-Mode Pratinjau 3D Interaktif (Tahap 5) ---
+    prev_group = parser.add_argument_group("Pratinjau Mesh 3D Interaktif Open3D (Tahap 5)")
+    prev_group.add_argument(
+        "--preview",
+        action="store_true",
+        help="Buka jendela Open3D Visualizer interaktif pada tahap validasi akhir",
+    )
+    prev_group.add_argument(
+        "--preview-wireframe",
+        action="store_true",
+        help="Aktifkan tampilan wireframe segitiga secara default saat pratinjau dibuka",
+    )
+    prev_group.add_argument(
+        "--confirm-export",
+        action="store_true",
+        help="Tampilkan pratinjau terlebih dahulu dan minta konfirmasi terminal [Y/n] sebelum menyimpan file",
     )
 
     # --- Input & Rekonstruksi Utama ---
@@ -1642,7 +1886,6 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        # 1. Jalankan mode kalibrasi papan catur jika diminta
         if args.calibrate_chessboard:
             calib_imgs = resolve_input_files(args.calibrate_chessboard)
             cols_f, rows_f = parse_wx_h(args.chessboard_size)
@@ -1660,7 +1903,6 @@ def main() -> int:
 
         input_files = resolve_input_files(args.input)
 
-        # 2. Muat parameter matriks intrinsik kamera (jika tersedia)
         intrinsics_cfg: Optional[CameraIntrinsicsConfig] = None
         if args.camera_calib is not None:
             intrinsics_cfg = CameraIntrinsicsConfig.from_json(args.camera_calib)
@@ -1674,7 +1916,6 @@ def main() -> int:
                 fx=vals[0], fy=vals[1], cx=vals[2], cy=vals[3], dist_coeffs=vals[4:]
             )
 
-        # 3. Konfigurasi Homografi 4-Titik (jika diaktifkan)
         homography_cfg: Optional[HomographyConfig] = None
         if args.homography_points is not None or args.pick_points:
             if args.homography_size is None:
@@ -1682,7 +1923,6 @@ def main() -> int:
                     "--homography-size (mis. 210x297) wajib diisi saat menggunakan homografi 4-titik."
                 )
             h_w, h_h = parse_wx_h(args.homography_size)
-            # Jika --pick-points dipakai tanpa --homography-points, inisialisasi dummy yang akan diganti GUI
             pts = (
                 parse_points_string(args.homography_points)
                 if args.homography_points is not None
@@ -1695,9 +1935,7 @@ def main() -> int:
                 keep_full_canvas=not args.homography_crop,
             )
 
-        # 4. Validasi Kalibrasi Skala Metrik
         if homography_cfg is not None:
-            # Nilai awal sementara; akan ditimpa presisi 1:1 oleh HomographyPerspectiveRectifier
             calib_cfg = CalibrationConfig(
                 ref_real_size=1.0,
                 ref_pixels=1.0,
@@ -1719,6 +1957,12 @@ def main() -> int:
                 invert_polarity=args.invert,
             )
 
+        preview_cfg = PreviewConfig(
+            enabled=args.preview or args.confirm_export,
+            wireframe=args.preview_wireframe,
+            confirm_before_export=args.confirm_export,
+        )
+
         config = PipelineConfig(
             input_paths=input_files,
             output_dir=args.output_dir,
@@ -1737,6 +1981,7 @@ def main() -> int:
             close_solid_base=not args.no_solid_base,
             taubin_iterations=args.taubin_iter,
             target_reduction=args.decimate,
+            preview=preview_cfg,
         )
 
         pipeline = ImageTo3DPipeline(config)
