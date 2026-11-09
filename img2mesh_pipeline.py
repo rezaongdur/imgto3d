@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-End-to-End 2D Image(s) to Calibrated 3D Solid Mesh Reconstruction Pipeline.
+End-to-End 2D Image(s) to Calibrated 3D Solid Mesh Reconstruction Pipeline
+(Dilengkapi Kalibrasi Intrinsik Kamera & Koreksi Perspektif Homografi 4-Titik).
 
-Mendukung dua mode rekonstruksi presisi tinggi:
-  - Mode A (CAD / Orthographic): Deteksi kontur sub-piksel, simplifikasi
-    Ramer-Douglas-Peucker, validasi topologi Shapely, triangulasi CDT,
-    dan ekstrusi sumbu Z untuk denah, logo, dan komponen mekanikal.
-  - Mode B (Surface / Relief / 3D): Estimasi depth map resolusi tinggi
-    (Depth Anything V2, MiDaS, atau Bilateral Heightmap), proyeksi point cloud
-    terkalibrasi Open3D, dan rekonstruksi Screened Poisson / Alpha Shapes
-    dengan penutupan alas solid watertight.
-
-Ekspor otomatis ke: .STL (binary), .OBJ + .MTL, .DAE (COLLADA Z-up SketchUp),
-dan .PLY (dengan vertex colors).
+Tahapan Pipeline:
+  - Tahap 0A: Kalibrasi & Undistorsi Matriks Intrinsik Kamera (Brown-Conrady / Zhang)
+  - Tahap 0B: Koreksi Perspektif Homografi 4-Titik (Metric Bird's-Eye Rectification)
+  - Tahap 1 : Preprocessing Adaptif (CLAHE + Bilateral Filter) & Kalibrasi Skala 1:1
+  - Tahap 2 : Rekonstruksi 3D Mode A (CAD Kontur Sub-Piksel + Ekstrusi) atau
+              Mode B (Depth Anything V2 / MiDaS / Heightmap + Poisson / Alpha Shapes)
+  - Tahap 3 : Mesh Cleaning & Topology Optimization (Watertight, Manifold, Taubin)
+  - Tahap 4 : Ekspor Multi-Format (.STL, .OBJ + .MTL, .DAE Z-up SketchUp, .PLY)
+  - Tahap 5 : Validasi Dimensi Fisik & Integritas Topologi Euler
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import logging
-import os
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -53,7 +52,7 @@ class PipelineError(Exception):
 
 
 class CalibrationError(PipelineError):
-    """Dilempar apabila parameter kalibrasi fisik tidak valid."""
+    """Dilempar apabila parameter kalibrasi kamera, homografi, atau skala tidak valid."""
 
 
 class GeometryExtractionError(PipelineError):
@@ -73,6 +72,88 @@ ModeType = Literal["cad", "surface"]
 MultiFileStrategy = Literal["batch", "stack", "merge"]
 DepthBackend = Literal["heightmap", "depth-anything", "midas"]
 SurfaceMethod = Literal["poisson", "alpha", "grid-solid"]
+
+
+@dataclass
+class CameraIntrinsicsConfig:
+    """Parameter matriks intrinsik kamera K dan koefisien distorsi lensa."""
+
+    camera_matrix: np.ndarray  # Bentuk (3, 3) float64
+    dist_coeffs: np.ndarray    # Bentuk (N,) float64: [k1, k2, p1, p2, k3]
+    calib_image_size: Optional[Tuple[int, int]] = None  # (width, height) saat kalibrasi
+    alpha: float = 0.0  # 0.0 = crop piksel hitam tepi, 1.0 = pertahankan semua piksel
+
+    def __post_init__(self) -> None:
+        self.camera_matrix = np.asarray(self.camera_matrix, dtype=np.float64)
+        self.dist_coeffs = np.asarray(self.dist_coeffs, dtype=np.float64).ravel()
+        if self.camera_matrix.shape != (3, 3):
+            raise CalibrationError("camera_matrix harus berukuran 3x3.")
+        if self.dist_coeffs.size < 4:
+            raise CalibrationError("dist_coeffs minimal memiliki 4 elemen [k1, k2, p1, p2].")
+
+    @classmethod
+    def from_json(cls, json_path: Path, alpha: float = 0.0) -> "CameraIntrinsicsConfig":
+        if not json_path.exists():
+            raise FileNotFoundError(f"File kalibrasi kamera tidak ditemukan: {json_path}")
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        k_mat = np.array(data["camera_matrix"], dtype=np.float64)
+        dist = np.array(data["dist_coeffs"], dtype=np.float64)
+        img_size = tuple(data["image_size"]) if "image_size" in data and data["image_size"] else None
+        return cls(camera_matrix=k_mat, dist_coeffs=dist, calib_image_size=img_size, alpha=alpha)
+
+    @classmethod
+    def from_manual_params(
+        cls,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        dist_coeffs: Sequence[float],
+        alpha: float = 0.0,
+    ) -> "CameraIntrinsicsConfig":
+        if fx <= 0 or fy <= 0:
+            raise CalibrationError("Focal length fx dan fy harus bernilai positif.")
+        k_mat = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return cls(camera_matrix=k_mat, dist_coeffs=np.array(dist_coeffs, dtype=np.float64), alpha=alpha)
+
+    def to_json(self, json_path: Path, reprojection_error: Optional[float] = None) -> None:
+        payload = {
+            "camera_matrix": self.camera_matrix.tolist(),
+            "dist_coeffs": self.dist_coeffs.tolist(),
+            "image_size": list(self.calib_image_size) if self.calib_image_size else None,
+            "rms_reprojection_error_px": reprojection_error,
+        }
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+@dataclass
+class HomographyConfig:
+    """Konfigurasi rektifikasi perspektif 4-titik ke bidang ortografis 1:1."""
+
+    src_points: np.ndarray        # Bentuk (4, 2) float32: [TL, TR, BR, BL] dalam piksel
+    rect_real_width: float        # Lebar fisik nyata bidang referensi (dalam satuan unit)
+    rect_real_height: float       # Tinggi fisik nyata bidang referensi (dalam satuan unit)
+    keep_full_canvas: bool = True # True = warp seluruh kanvas, False = crop ke 4 titik
+    target_ppu: Optional[float] = None  # Piksel per unit fisik (None = hitung otomatis)
+
+    def __post_init__(self) -> None:
+        self.src_points = np.asarray(self.src_points, dtype=np.float32)
+        if self.src_points.shape != (4, 2):
+            raise CalibrationError(
+                "src_points harus berisi tepat 4 titik koordinat (x, y) berurutan [TL, TR, BR, BL]."
+            )
+        if self.rect_real_width <= 0.0 or self.rect_real_height <= 0.0:
+            raise CalibrationError("Dimensi fisik referensi homografi (width & height) harus > 0.")
+        # Validasi bahwa keempat titik membentuk segi empat konveks non-degenerasi
+        area = cv2.contourArea(self.src_points)
+        if area < 100.0:
+            raise CalibrationError(
+                "Luas poligon 4 titik homografi terlalu kecil atau kolinear (degenerasi)."
+            )
 
 
 @dataclass
@@ -117,6 +198,10 @@ class PipelineConfig:
     calibration: CalibrationConfig = field(
         default_factory=lambda: CalibrationConfig(100.0, 100.0, "mm", 5.0)
     )
+    # Tahap 0: Camera Intrinsics & Homography Perspective Rectification
+    camera_intrinsics: Optional[CameraIntrinsicsConfig] = None
+    homography: Optional[HomographyConfig] = None
+    interactive_pick_points: bool = False
     # Tahap 1: Preprocessing
     clahe_clip: float = 2.0
     bilateral_d: int = 9
@@ -165,19 +250,318 @@ class ValidationReport:
 
 
 # ==============================================================================
+# TAHAP 0A: KALIBRASI MATRIKS INTRINSIK & UNDISTORSI LENSA KAMERA
+# ==============================================================================
+
+
+class CameraIntrinsicsCalibrator:
+    """
+    Menangani kalibrasi kamera Zhang menggunakan pola papan catur (chessboard)
+    serta koreksi distorsi radial dan tangensial pada citra input.
+    """
+
+    @staticmethod
+    def calibrate_from_chessboard(
+        image_paths: Sequence[Path],
+        board_size: Tuple[int, int],
+        square_size: float,
+        save_path: Path,
+    ) -> CameraIntrinsicsConfig:
+        """
+        Menghitung matriks intrinsik K dan koefisien distorsi dari sekumpulan
+        citra kalibrasi papan catur.
+        board_size: (jumlah_sudut_dalam_kolom, jumlah_sudut_dalam_baris), mis. (9, 6).
+        """
+        if square_size <= 0:
+            raise CalibrationError("square_size papan catur harus lebih besar dari 0.")
+
+        cols, rows = board_size
+        objp = np.zeros((rows * cols, 3), np.float32)
+        objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * float(square_size)
+
+        obj_points: List[np.ndarray] = []
+        img_points: List[np.ndarray] = []
+        img_shape: Optional[Tuple[int, int]] = None
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
+
+        for path in image_paths:
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                logger.warning("Melewati file kalibrasi tidak valid: %s", path)
+                continue
+
+            h, w = img.shape[:2]
+            if img_shape is None:
+                img_shape = (w, h)
+            elif img_shape != (w, h):
+                logger.warning("Resolusi %s berbeda dari citra kalibrasi pertama, dilewati.", path.name)
+                continue
+
+            found, corners = cv2.findChessboardCornersSB(
+                img, (cols, rows), flags=cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY
+            )
+            if not found:
+                found, corners = cv2.findChessboardCorners(img, (cols, rows), None)
+                if found and corners is not None:
+                    corners = cv2.cornerSubPix(img, corners, (11, 11), (-1, -1), criteria)
+
+            if found and corners is not None:
+                obj_points.append(objp)
+                img_points.append(corners)
+                logger.info("Sudut papan catur terdeteksi pada: %s", path.name)
+            else:
+                logger.warning("Papan catur tidak terdeteksi pada: %s", path.name)
+
+        if len(obj_points) < 3 or img_shape is None:
+            raise CalibrationError(
+                f"Minimal dibutuhkan 3 citra papan catur valid untuk kalibrasi (ditemukan: {len(obj_points)})."
+            )
+
+        rms_error, k_mat, dist_coeffs, _, _ = cv2.calibrateCamera(
+            obj_points, img_points, img_shape, None, None
+        )
+        logger.info("Kalibrasi Kamera Selesai | RMS Reprojection Error: %.4f piksel", rms_error)
+
+        cfg = CameraIntrinsicsConfig(
+            camera_matrix=k_mat,
+            dist_coeffs=dist_coeffs,
+            calib_image_size=img_shape,
+        )
+        cfg.to_json(save_path, reprojection_error=float(rms_error))
+        logger.info("Parameter intrinsik disimpan ke: %s", save_path.resolve())
+        return cfg
+
+    @staticmethod
+    def undistort_image(
+        img_bgr: np.ndarray, intrinsics: CameraIntrinsicsConfig
+    ) -> np.ndarray:
+        """
+        Menghilangkan distorsi lensa dengan penskalaan otomatis matriks K jika
+        resolusi citra berbeda dari resolusi saat kalibrasi.
+        """
+        h, w = img_bgr.shape[:2]
+        k_mat = intrinsics.camera_matrix.copy()
+
+        if intrinsics.calib_image_size is not None:
+            cal_w, cal_h = intrinsics.calib_image_size
+            if (cal_w, cal_h) != (w, h):
+                sx = w / float(cal_w)
+                sy = h / float(cal_h)
+                k_mat[0, 0] *= sx
+                k_mat[0, 2] *= sx
+                k_mat[1, 1] *= sy
+                k_mat[1, 2] *= sy
+                logger.info(
+                    "Menyesuaikan matriks intrinsik K dari (%dx%d) ke resolusi (%dx%d).",
+                    cal_w, cal_h, w, h,
+                )
+
+        new_k, _ = cv2.getOptimalNewCameraMatrix(
+            k_mat, intrinsics.dist_coeffs, (w, h), alpha=intrinsics.alpha, newImgSize=(w, h)
+        )
+        map_x, map_y = cv2.initUndistortRectifyMap(
+            k_mat, intrinsics.dist_coeffs, None, new_k, (w, h), m1type=cv2.CV_32FC1
+        )
+        undistorted = cv2.remap(
+            img_bgr, map_x, map_y, interpolation=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE
+        )
+        return undistorted
+
+
+# ==============================================================================
+# TAHAP 0B: KOREKSI PERSPEKTIF HOMOGRAFI 4-TITIK (METRIC RECTIFICATION)
+# ==============================================================================
+
+
+class HomographyPerspectiveRectifier:
+    """
+    Meluruskan foto miring (oblique perspective) menjadi tampak atas ortografis
+    (bird's-eye view) 1:1 menggunakan transformasi homografi planar 4-titik.
+    """
+
+    @staticmethod
+    def interactive_pick_4_points(img_bgr: np.ndarray, window_title: str = "Pilih 4 Sudut Referensi (TL -> TR -> BR -> BL)") -> np.ndarray:
+        """
+        Membuka jendela interaktif OpenCV agar pengguna dapat mengklik 4 sudut
+        bidang referensi secara berurutan: Kiri-Atas, Kanan-Atas, Kanan-Bawah, Kiri-Bawah.
+        """
+        display = img_bgr.copy()
+        h, w = display.shape[:2]
+        max_disp = 1200.0
+        disp_scale = min(1.0, max_disp / float(max(h, w)))
+        if disp_scale < 1.0:
+            display = cv2.resize(display, (int(w * disp_scale), int(h * disp_scale)), interpolation=cv2.INTER_AREA)
+
+        clicked: List[Tuple[float, float]] = []
+        labels = ["1: Top-Left", "2: Top-Right", "3: Bottom-Right", "4: Bottom-Left"]
+
+        def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+            if event == cv2.EVENT_LBUTTONDOWN and len(clicked) < 4:
+                orig_x = x / disp_scale
+                orig_y = y / disp_scale
+                clicked.append((orig_x, orig_y))
+
+                cv2.circle(display, (x, y), 6, (0, 255, 0), -1)
+                cv2.putText(
+                    display,
+                    labels[len(clicked) - 1],
+                    (x + 8, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0),
+                    2,
+                )
+                if len(clicked) > 1:
+                    p_prev = (int(clicked[-2][0] * disp_scale), int(clicked[-2][1] * disp_scale))
+                    cv2.line(display, p_prev, (x, y), (0, 220, 255), 2)
+                if len(clicked) == 4:
+                    p_first = (int(clicked[0][0] * disp_scale), int(clicked[0][1] * disp_scale))
+                    cv2.line(display, (x, y), p_first, (0, 220, 255), 2)
+                cv2.imshow(window_title, display)
+
+        try:
+            cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
+            cv2.setMouseCallback(window_title, on_mouse)
+            cv2.imshow(window_title, display)
+            logger.info("Klik 4 sudut referensi pada jendela gambar (TL -> TR -> BR -> BL), lalu tekan tombol apa saja.")
+
+            while True:
+                key = cv2.waitKey(30) & 0xFF
+                if key == 27:  # ESC
+                    raise CalibrationError("Pemilihan 4 titik homografi dibatalkan pengguna (ESC).")
+                if len(clicked) == 4 and key != 255:
+                    break
+        except cv2.error as exc:
+            raise CalibrationError(
+                f"Gagal membuka GUI OpenCV untuk --pick-points (gunakan --homography-points pada server headless): {exc}"
+            ) from exc
+        finally:
+            cv2.destroyAllWindows()
+
+        if len(clicked) != 4:
+            raise CalibrationError("Harus memilih tepat 4 titik referensi sebelum melanjutkan.")
+
+        return np.array(clicked, dtype=np.float32)
+
+    @staticmethod
+    def rectify(
+        img_bgr: np.ndarray, h_cfg: HomographyConfig
+    ) -> Tuple[np.ndarray, float, np.ndarray]:
+        """
+        Menerapkan koreksi perspektif homografi 4-titik dan mengembalikan:
+          1. Citra hasil rektifikasi ortografis (img_rectified)
+          2. Faktor skala metrik baru (scale_per_pixel = 1.0 / pixels_per_unit)
+          3. Matriks homografi 3x3 akhir yang diterapkan
+        """
+        src = h_cfg.src_points
+        # Hitung panjang piksel tepi atas/bawah dan kiri/kanan untuk menentukan kerapatan piksel optimal
+        top_w_px = float(np.linalg.norm(src[1] - src[0]))
+        bot_w_px = float(np.linalg.norm(src[2] - src[3]))
+        left_h_px = float(np.linalg.norm(src[3] - src[0]))
+        right_h_px = float(np.linalg.norm(src[2] - src[1]))
+
+        if h_cfg.target_ppu is not None and h_cfg.target_ppu > 0:
+            ppu = float(h_cfg.target_ppu)
+        else:
+            ppu_w = max(top_w_px, bot_w_px) / h_cfg.rect_real_width
+            ppu_h = max(left_h_px, right_h_px) / h_cfg.rect_real_height
+            ppu = max(ppu_w, ppu_h)
+
+        dst_w = h_cfg.rect_real_width * ppu
+        dst_h = h_cfg.rect_real_height * ppu
+
+        dst_ref = np.array(
+            [
+                [0.0, 0.0],
+                [dst_w, 0.0],
+                [dst_w, dst_h],
+                [0.0, dst_h],
+            ],
+            dtype=np.float32,
+        )
+
+        h_mat = cv2.getPerspectiveTransform(src, dst_ref)
+
+        if not h_cfg.keep_full_canvas:
+            out_w = max(16, int(round(dst_w)))
+            out_h = max(16, int(round(dst_h)))
+            rectified = cv2.warpPerspective(
+                img_bgr,
+                h_mat,
+                (out_w, out_h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255, 255, 255),
+            )
+            final_h = h_mat
+        else:
+            # Proyeksikan keempat sudut kanvas citra asli agar seluruh denah/objek tetap utuh
+            ih, iw = img_bgr.shape[:2]
+            canvas_corners = np.array(
+                [[[0.0, 0.0]], [[iw, 0.0]], [[iw, ih]], [[0.0, ih]]],
+                dtype=np.float32,
+            )
+            warped_corners = cv2.perspectiveTransform(canvas_corners, h_mat).reshape(-1, 2)
+
+            min_xy = np.floor(warped_corners.min(axis=0))
+            max_xy = np.ceil(warped_corners.max(axis=0))
+            out_w = int(max_xy[0] - min_xy[0])
+            out_h = int(max_xy[1] - min_xy[1])
+
+            # Guardrail memori apabila sudut kamera terlalu ekstrem (grazing angle)
+            if out_w > 12000 or out_h > 12000 or out_w <= 0 or out_h <= 0:
+                raise CalibrationError(
+                    f"Ukuran kanvas hasil homografi full-canvas tidak wajar ({out_w}x{out_h} px). "
+                    "Gunakan --homography-crop atau periksa urutan titik [TL, TR, BR, BL]."
+                )
+
+            t_mat = np.array(
+                [
+                    [1.0, 0.0, -min_xy[0]],
+                    [0.0, 1.0, -min_xy[1]],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            final_h = t_mat @ h_mat
+            rectified = cv2.warpPerspective(
+                img_bgr,
+                final_h,
+                (out_w, out_h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255, 255, 255),
+            )
+
+        scale_per_pixel = 1.0 / ppu
+        logger.info(
+            "Rektifikasi Homografi 4-Titik Selesai | Output: %dx%d px | Skala Presisi: %.6f unit/px",
+            rectified.shape[1],
+            rectified.shape[0],
+            scale_per_pixel,
+        )
+        return rectified, scale_per_pixel, final_h
+
+
+# ==============================================================================
 # TAHAP 1: PREPROCESSING & KALIBRASI SKALA
 # ==============================================================================
 
 
 class ImagePreprocessor:
-    """Menangani koreksi kontras adaptif, bilateral filtering, dan binarisasi."""
+    """
+    Menangani pemuatan citra, koreksi lensa & perspektif (Tahap 0),
+    koreksi kontras adaptif CLAHE, bilateral filtering, dan binarisasi.
+    """
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
 
-    def load_image(self, image_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    def load_and_rectify_image(self, image_path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Memuat citra BGR dan versi RGB-nya dengan validasi integritas file.
+        Memuat citra BGR, menerapkan undistorsi matriks intrinsik kamera (jika ada),
+        dan menerapkan koreksi perspektif homografi 4-titik (jika ada).
         """
         if not image_path.exists() or not image_path.is_file():
             raise FileNotFoundError(f"File citra tidak ditemukan: {image_path}")
@@ -194,6 +578,24 @@ class ImagePreprocessor:
             img_bgr = np.clip(bgr * alpha + white_bg * (1.0 - alpha), 0, 255).astype(np.uint8)
         elif img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+
+        # Tahap 0A: Koreksi distorsi lensa menggunakan matriks intrinsik kamera
+        if self.cfg.camera_intrinsics is not None:
+            logger.info("Menerapkan koreksi distorsi lensa dari matriks intrinsik kamera...")
+            img_bgr = CameraIntrinsicsCalibrator.undistort_image(img_bgr, self.cfg.camera_intrinsics)
+
+        # Tahap 0B: Koreksi perspektif homografi 4-titik & sinkronisasi skala 1:1
+        if self.cfg.homography is not None:
+            if self.cfg.interactive_pick_points:
+                picked = HomographyPerspectiveRectifier.interactive_pick_4_points(img_bgr)
+                self.cfg.homography.src_points = picked
+
+            img_bgr, new_scale_per_px, _ = HomographyPerspectiveRectifier.rectify(
+                img_bgr, self.cfg.homography
+            )
+            # Perbarui skala kalibrasi secara otomatis agar 100% sinkron dengan hasil homografi
+            self.cfg.calibration.ref_real_size = new_scale_per_px
+            self.cfg.calibration.ref_pixels = 1.0
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return img_bgr, img_rgb
@@ -248,7 +650,6 @@ class ImagePreprocessor:
                 self.cfg.adaptive_c,
             )
 
-        # Operasi morfologi ringan untuk menutup celah 1-piksel tanpa membulatkan sudut
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
         return binary
@@ -272,10 +673,6 @@ class CadOrthographicReconstructor:
     def _refine_contours_subpixel(
         self, gray_img: np.ndarray, contours: Sequence[np.ndarray]
     ) -> List[np.ndarray]:
-        """
-        Memperhalus koordinat titik kontur ke presisi sub-piksel menggunakan
-        cv2.cornerSubPix pada titik sudut dominan.
-        """
         refined: List[np.ndarray] = []
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
         h, w = gray_img.shape[:2]
@@ -284,7 +681,6 @@ class CadOrthographicReconstructor:
             pts = cnt.reshape(-1, 2).astype(np.float32)
             if len(pts) < 3:
                 continue
-            # Filter titik yang terlalu dekat dengan batas gambar agar window subPix aman
             valid_mask = (
                 (pts[:, 0] >= 3) & (pts[:, 0] < w - 3) & (pts[:, 1] >= 3) & (pts[:, 1] < h - 3)
             )
@@ -301,14 +697,9 @@ class CadOrthographicReconstructor:
     def _extract_shapely_polygons(
         self, binary_mask: np.ndarray, denoised_gray: np.ndarray
     ) -> List[Polygon]:
-        """
-        Membangun poligon Shapely berlubang (exterior + interior holes) yang
-        terkalibrasi dalam satuan fisik nyata.
-        """
         h, _ = binary_mask.shape[:2]
         scale = self.cfg.calibration.scale_per_pixel
 
-        # RETR_CCOMP menyusun hierarki 2 level: level 0 = exterior, level 1 = hole
         contours, hierarchy = cv2.findContours(
             binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
         )
@@ -321,7 +712,6 @@ class CadOrthographicReconstructor:
         raw_polygons: List[Polygon] = []
 
         for idx, cnt in enumerate(contours):
-            # Proses hanya kontur terluar (parent == -1)
             if hier[idx][3] != -1:
                 continue
 
@@ -329,7 +719,6 @@ class CadOrthographicReconstructor:
             if area_px < self.cfg.min_contour_area_px:
                 continue
 
-            # Aproksimasi poligon Ramer-Douglas-Peucker dengan epsilon sangat kecil
             approx_ext = cv2.approxPolyDP(cnt, epsilon=self.cfg.rdp_epsilon_px, closed=True)
             refined_ext = self._refine_contours_subpixel(denoised_gray, [approx_ext])
             if not refined_ext or len(refined_ext[0]) < 3:
@@ -338,7 +727,6 @@ class CadOrthographicReconstructor:
             ext_pts_px = refined_ext[0]
             ext_coords = [(float(x * scale), float((h - y) * scale)) for x, y in ext_pts_px]
 
-            # Kumpulkan seluruh lubang (holes) yang merupakan child langsung dari kontur ini
             holes_coords: List[List[Tuple[float, float]]] = []
             child_idx = hier[idx][2]
             while child_idx != -1:
@@ -359,7 +747,6 @@ class CadOrthographicReconstructor:
             if not poly.is_valid:
                 poly = make_valid(poly)
 
-            # Ekstrak semua Polygon valid dari hasil make_valid
             if isinstance(poly, Polygon) and poly.area > 0:
                 raw_polygons.append(poly)
             elif isinstance(poly, (MultiPolygon, GeometryCollection)):
@@ -381,19 +768,13 @@ class CadOrthographicReconstructor:
         img_rgb: np.ndarray,
         z_offset: float = 0.0,
     ) -> trimesh.Trimesh:
-        """
-        Mengekstrusi poligon terkalibrasi menjadi mesh solid 3D watertight
-        dengan pewarnaan vertex yang disampel dari citra input.
-        """
         polygons = self._extract_shapely_polygons(binary_mask, denoised_gray)
         extruded_parts: List[trimesh.Trimesh] = []
         height = self.cfg.calibration.extrude_height
 
         for poly in polygons:
-            # Orientasi standar Shapely (CCW exterior, CW holes)
-            oriented_poly = poly
             try:
-                mesh_part = trimesh.creation.extrude_polygon(oriented_poly, height=height)
+                mesh_part = trimesh.creation.extrude_polygon(poly, height=height)
                 if z_offset != 0.0:
                     mesh_part.apply_translation([0.0, 0.0, z_offset])
                 extruded_parts.append(mesh_part)
@@ -409,7 +790,6 @@ class CadOrthographicReconstructor:
             else trimesh.util.concatenate(extruded_parts)
         )
 
-        # Sampel warna RGB dari citra asli berdasarkan proyeksi (X, Y) vertex
         self._apply_projected_vertex_colors(combined, img_rgb)
         return combined
 
@@ -442,11 +822,6 @@ class SurfaceReliefReconstructor:
         self._depth_pipe = None
 
     def _estimate_depth_map(self, img_rgb: np.ndarray, denoised_gray: np.ndarray) -> np.ndarray:
-        """
-        Menghasilkan depth map ternormalisasi [0.0, 1.0].
-        Mendukung Depth Anything V2 / MiDaS via HuggingFace Transformers,
-        dengan fallback deterministik ke Bilateral Photometric Heightmap.
-        """
         backend = self.cfg.depth_backend
 
         if backend in ("depth-anything", "midas"):
@@ -490,25 +865,18 @@ class SurfaceReliefReconstructor:
                     exc,
                 )
 
-        # Fallback / Default Presisi Tinggi: Bilateral Photometric Heightmap
         depth_norm = denoised_gray.astype(np.float32) / 255.0
         if self.cfg.calibration.invert_polarity:
             depth_norm = 1.0 - depth_norm
-        # Penghalusan sub-piksel Gaussian ringan untuk menghilangkan kuantisasi 8-bit
         depth_norm = gaussian_filter(depth_norm, sigma=0.8)
         return np.clip(depth_norm, 0.0, 1.0)
 
     def build_calibrated_point_cloud(
         self, img_rgb: np.ndarray, denoised_gray: np.ndarray
     ) -> Tuple[o3d.geometry.PointCloud, np.ndarray, np.ndarray]:
-        """
-        Memproyeksikan piksel terkalibrasi menjadi Open3D PointCloud dengan
-        estimasi normal permukaan yang konsisten secara topologis.
-        """
         depth_map = self._estimate_depth_map(img_rgb, denoised_gray)
         h, w = depth_map.shape[:2]
 
-        # Downsampling terukur jika resolusi citra melebihi max_grid_dim demi efisiensi memori
         max_dim = max(h, w)
         if max_dim > self.cfg.max_grid_dim:
             ratio = self.cfg.max_grid_dim / float(max_dim)
@@ -539,7 +907,6 @@ class SurfaceReliefReconstructor:
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(colors)
 
-        # Estimasi dan orientasi normal konsisten ke arah +Z
         radius = eff_scale * 3.0
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30)
@@ -551,18 +918,12 @@ class SurfaceReliefReconstructor:
     def _build_watertight_grid_solid(
         self, z_grid: np.ndarray, rgb_grid: np.ndarray, eff_scale: float
     ) -> trimesh.Trimesh:
-        """
-        Membangun solid relief 3D 100% watertight dan manifold dari grid elevasi
-        terkalibrasi lengkap dengan 4 dinding samping dan alas datar Z = 0.
-        """
         gh, gw = z_grid.shape
         u = np.arange(gw, dtype=np.float64) * eff_scale
         v = (gh - np.arange(gh, dtype=np.float64)) * eff_scale
         xx, yy = np.meshgrid(u, v)
 
-        # Top surface vertices: indeks 0 .. (gh*gw - 1)
         top_verts = np.stack([xx, yy, z_grid], axis=-1).reshape(-1, 3)
-        # Bottom base vertices (Z = 0): indeks (gh*gw) .. (2*gh*gw - 1)
         bot_verts = np.stack([xx, yy, np.zeros_like(z_grid)], axis=-1).reshape(-1, 3)
         vertices = np.vstack([top_verts, bot_verts])
 
@@ -581,37 +942,28 @@ class SurfaceReliefReconstructor:
         def idx_bot(r: int, c: int) -> int:
             return offset + r * gw + c
 
-        # 1. Permukaan atas (normal menghadap +Z) & Permukaan bawah (normal menghadap -Z)
         for r in range(gh - 1):
             for c in range(gw - 1):
                 t00, t01 = idx_top(r, c), idx_top(r, c + 1)
                 t10, t11 = idx_top(r + 1, c), idx_top(r + 1, c + 1)
-                # Top faces (CCW dilihat dari atas +Z)
                 faces.append([t00, t10, t11])
                 faces.append([t00, t11, t01])
 
                 b00, b01 = idx_bot(r, c), idx_bot(r, c + 1)
                 b10, b11 = idx_bot(r + 1, c), idx_bot(r + 1, c + 1)
-                # Bottom faces (CCW dilihat dari bawah -Z)
                 faces.append([b00, b11, b10])
                 faces.append([b00, b01, b11])
 
-        # 2. Dinding tepi Utara (r = 0, menghadap +Y) & Selatan (r = gh - 1, menghadap -Y)
         for c in range(gw - 1):
-            # Utara (r = 0)
             faces.append([idx_top(0, c), idx_top(0, c + 1), idx_bot(0, c + 1)])
             faces.append([idx_top(0, c), idx_bot(0, c + 1), idx_bot(0, c)])
-            # Selatan (r = gh - 1)
             r_last = gh - 1
             faces.append([idx_top(r_last, c), idx_bot(r_last, c + 1), idx_top(r_last, c + 1)])
             faces.append([idx_top(r_last, c), idx_bot(r_last, c), idx_bot(r_last, c + 1)])
 
-        # 3. Dinding tepi Barat (c = 0, menghadap -X) & Timur (c = gw - 1, menghadap +X)
         for r in range(gh - 1):
-            # Barat (c = 0)
             faces.append([idx_top(r, 0), idx_bot(r + 1, 0), idx_top(r + 1, 0)])
             faces.append([idx_top(r, 0), idx_bot(r, 0), idx_bot(r + 1, 0)])
-            # Timur (c = gw - 1)
             c_last = gw - 1
             faces.append([idx_top(r, c_last), idx_top(r + 1, c_last), idx_bot(r + 1, c_last)])
             faces.append([idx_top(r, c_last), idx_bot(r + 1, c_last), idx_bot(r, c_last)])
@@ -632,11 +984,12 @@ class SurfaceReliefReconstructor:
         rgb_grid: Optional[np.ndarray] = None,
         eff_scale: Optional[float] = None,
     ) -> trimesh.Trimesh:
-        """
-        Membangun mesh 3D dari Point Cloud terkalibrasi menggunakan metode
-        Poisson, Alpha Shapes, atau Grid Solid Watertight.
-        """
-        if self.cfg.surface_method == "grid-solid" and z_grid is not None and rgb_grid is not None and eff_scale is not None:
+        if (
+            self.cfg.surface_method == "grid-solid"
+            and z_grid is not None
+            and rgb_grid is not None
+            and eff_scale is not None
+        ):
             return self._build_watertight_grid_solid(z_grid, rgb_grid, eff_scale)
 
         if self.cfg.surface_method == "alpha":
@@ -659,11 +1012,13 @@ class SurfaceReliefReconstructor:
                 vertices_to_remove = densities_arr < thresh
                 mesh_o3d.remove_vertices_by_mask(vertices_to_remove)
 
-            # Jika close_solid_base aktif dan data grid tersedia, gunakan hasil Poisson
-            # untuk menyaring elevasi lalu tutup menjadi solid watertight
-            if self.cfg.close_solid_base and z_grid is not None and rgb_grid is not None and eff_scale is not None:
+            if (
+                self.cfg.close_solid_base
+                and z_grid is not None
+                and rgb_grid is not None
+                and eff_scale is not None
+            ):
                 logger.info("Menutup alas bawah Z=0 untuk menjamin solid watertight siap cetak...")
-                # Haluskan z_grid sesuai rekonstruksi Poisson sebelum menutup alas
                 z_smoothed = gaussian_filter(z_grid, sigma=0.6)
                 return self._build_watertight_grid_solid(z_smoothed, rgb_grid, eff_scale)
 
@@ -695,17 +1050,14 @@ class MeshTopologyOptimizer:
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
 
-    def clean_and_optimize(self, mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, o3d.geometry.TriangleMesh]:
-        """
-        Menjalankan pembersihan mesh multi-tahap di Trimesh dan Open3D.
-        """
-        # 1. Pembersihan dasar Trimesh (hapus segitiga nol, duplikat, dan vertex yatim)
+    def clean_and_optimize(
+        self, mesh: trimesh.Trimesh
+    ) -> Tuple[trimesh.Trimesh, o3d.geometry.TriangleMesh]:
         mesh.update_faces(mesh.nondegenerate_faces())
         mesh.update_faces(mesh.unique_faces())
         mesh.remove_unreferenced_vertices()
         mesh.merge_vertices()
 
-        # 2. Hapus pulau noise terisolasi jika ukurannya sangat kecil (< 0.1% dari total face)
         components = mesh.split(only_watertight=False)
         if len(components) > 1:
             total_faces = len(mesh.faces)
@@ -717,7 +1069,6 @@ class MeshTopologyOptimizer:
                     else trimesh.util.concatenate(significant)
                 )
 
-        # 3. Konversi ke Open3D untuk pembersihan non-manifold & Taubin smoothing
         o3d_mesh = o3d.geometry.TriangleMesh()
         o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
         o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32))
@@ -737,7 +1088,6 @@ class MeshTopologyOptimizer:
         o3d_mesh.remove_non_manifold_edges()
         o3d_mesh.remove_unreferenced_vertices()
 
-        # 4. Taubin Smoothing (bebas penyusutan volume, menjaga ketajaman sudut CAD)
         if self.cfg.taubin_iterations > 0 and self.cfg.mode == "surface":
             o3d_mesh = o3d_mesh.filter_smooth_taubin(
                 number_of_iterations=self.cfg.taubin_iterations,
@@ -745,7 +1095,6 @@ class MeshTopologyOptimizer:
                 mu=-0.53,
             )
 
-        # 5. Edge-Preserving Quadric Edge Collapse Decimation (opsional jika diminta)
         if 0.0 < self.cfg.target_reduction < 0.95:
             current_tris = len(o3d_mesh.triangles)
             target_tris = max(12, int(current_tris * (1.0 - self.cfg.target_reduction)))
@@ -756,7 +1105,6 @@ class MeshTopologyOptimizer:
 
         o3d_mesh.compute_vertex_normals()
 
-        # 6. Sinkronisasi kembali ke Trimesh + Penutupan Lubang & Perbaikan Normal
         opt_verts = np.asarray(o3d_mesh.vertices)
         opt_faces = np.asarray(o3d_mesh.triangles)
         opt_colors = None
@@ -776,7 +1124,6 @@ class MeshTopologyOptimizer:
         trimesh.repair.fix_inversion(final_tm)
         trimesh.repair.fix_normals(final_tm)
 
-        # Pastikan orientasi normal mengarah ke luar (volume bertanda positif)
         if final_tm.is_watertight and final_tm.volume < 0:
             final_tm.invert()
 
@@ -809,23 +1156,19 @@ class MultiFormatMeshExporter:
         self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
         exported: Dict[str, Path] = {}
 
-        # 1. Binary .STL
         stl_path = self.cfg.output_dir / f"{base_name}.stl"
         mesh.export(str(stl_path), file_type="stl")
         exported["STL"] = stl_path
 
-        # 2. .OBJ + .MTL (lengkap dengan UV dan normal)
         obj_path = self.cfg.output_dir / f"{base_name}.obj"
         self._export_obj_with_mtl(mesh, obj_path, base_name)
         exported["OBJ"] = obj_path
         exported["MTL"] = self.cfg.output_dir / f"{base_name}.mtl"
 
-        # 3. .DAE / COLLADA (Z-up & skala metrik presisi untuk SketchUp)
         dae_path = self.cfg.output_dir / f"{base_name}.dae"
         self._export_sketchup_collada(mesh, dae_path)
         exported["DAE"] = dae_path
 
-        # 4. .PLY (dengan informasi vertex colors & normal)
         ply_path = self.cfg.output_dir / f"{base_name}.ply"
         o3d.io.write_triangle_mesh(
             str(ply_path),
@@ -839,14 +1182,9 @@ class MultiFormatMeshExporter:
         return exported
 
     def _export_obj_with_mtl(self, mesh: trimesh.Trimesh, obj_path: Path, base_name: str) -> None:
-        """
-        Menulis file Wavefront .OBJ beserta file material .MTL dengan koordinat
-        tekstur UV terproyeksi planar dan vektor normal vertex.
-        """
         mtl_filename = f"{base_name}.mtl"
         mtl_path = obj_path.with_suffix(".mtl")
 
-        # Hitung rata-rata warna difus dari vertex colors jika ada
         kd = (0.78, 0.80, 0.84)
         if (
             hasattr(mesh.visual, "vertex_colors")
@@ -868,7 +1206,6 @@ class MultiFormatMeshExporter:
         )
         mtl_path.write_text(mtl_content, encoding="utf-8")
 
-        # Hitung koordinat UV planar ternormalisasi [0, 1] berdasarkan bounding box XY
         verts = mesh.vertices
         normals = mesh.vertex_normals
         faces = mesh.faces
@@ -898,15 +1235,9 @@ class MultiFormatMeshExporter:
         obj_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _export_sketchup_collada(self, mesh: trimesh.Trimesh, dae_path: Path) -> None:
-        """
-        Mengekspor ke format COLLADA (.DAE) dan menyuntikkan tag <unit> serta
-        <up_axis>Z_UP</up_axis> sehingga SketchUp langsung mengimpor pada
-        orientasi Z-up dan skala fisik 1:1 tanpa distorsi.
-        """
         dae_bytes = trimesh.exchange.dae.export_collada(mesh)
         dae_xml_str = dae_bytes.decode("utf-8") if isinstance(dae_bytes, bytes) else str(dae_bytes)
 
-        # Daftarkan namespace COLLADA 1.4.1
         ns_uri = "http://www.collada.org/2005/11/COLLADASchema"
         ET.register_namespace("", ns_uri)
         root = ET.fromstring(dae_xml_str)
@@ -949,11 +1280,11 @@ class MeshValidator:
         unit: str,
         exported_files: Dict[str, Path],
     ) -> ValidationReport:
-        extents = mesh.extents  # [Panjang X, Lebar Y, Tinggi Z]
+        extents = mesh.extents
         is_wt = bool(mesh.is_watertight)
         volume = float(mesh.volume) if is_wt else None
 
-        report = ValidationReport(
+        return ValidationReport(
             model_name=model_name,
             unit=unit,
             length_x=float(extents[0]),
@@ -969,7 +1300,6 @@ class MeshValidator:
             is_winding_consistent=bool(mesh.is_winding_consistent),
             exported_files=exported_files,
         )
-        return report
 
     @staticmethod
     def print_report(report: ValidationReport) -> None:
@@ -1001,7 +1331,7 @@ class MeshValidator:
 
 
 class ImageTo3DPipeline:
-    """Orkestrator end-to-end yang menghubungkan seluruh 5 tahapan presisi."""
+    """Orkestrator end-to-end yang menghubungkan seluruh tahapan presisi."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
@@ -1044,12 +1374,11 @@ class ImageTo3DPipeline:
             voxel_size = self.cfg.calibration.scale_per_pixel * 1.5
 
             for idx, img_path in enumerate(files):
-                img_bgr, img_rgb = self.preprocessor.load_image(img_path)
+                img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
                 denoised = self.preprocessor.enhance_and_denoise(img_bgr)
                 pcd, _, _ = self.surface_reconstructor.build_calibrated_point_cloud(img_rgb, denoised)
 
                 if idx > 0 and len(combined_pcd.points) > 0:
-                    # Registrasi halus Point-to-Plane ICP antar awan titik
                     reg = o3d.pipelines.registration.registration_icp(
                         pcd,
                         combined_pcd,
@@ -1072,7 +1401,7 @@ class ImageTo3DPipeline:
         return reports
 
     def _process_single_file(self, img_path: Path, z_offset: float) -> trimesh.Trimesh:
-        img_bgr, img_rgb = self.preprocessor.load_image(img_path)
+        img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
         denoised = self.preprocessor.enhance_and_denoise(img_bgr)
 
         if self.cfg.mode == "cad":
@@ -1116,12 +1445,11 @@ class ImageTo3DPipeline:
 
 
 # ==============================================================================
-# ANTARMUKA CLI (COMMAND-LINE INTERFACE)
+# PARSING & ANTARMUKA CLI (COMMAND-LINE INTERFACE)
 # ==============================================================================
 
 
 def resolve_input_files(raw_inputs: Sequence[str]) -> List[Path]:
-    """Mengurai path tunggal, multi-file, direktori, atau pola wildcard."""
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     resolved: List[Path] = []
 
@@ -1146,15 +1474,102 @@ def resolve_input_files(raw_inputs: Sequence[str]) -> List[Path]:
     return resolved
 
 
-def parse_args() -> PipelineConfig:
+def parse_points_string(pts_str: str) -> np.ndarray:
+    """Mengurai format titik 'x1,y1;x2,y2;x3,y3;x4,y4' menjadi array (4, 2)."""
+    pairs = [seg.strip() for seg in pts_str.split(";") if seg.strip()]
+    if len(pairs) != 4:
+        raise CalibrationError(
+            f"--homography-points harus berisi tepat 4 titik dipisah ';' (ditemukan: {len(pairs)})."
+        )
+    coords: List[Tuple[float, float]] = []
+    for pair in pairs:
+        xy = pair.split(",")
+        if len(xy) != 2:
+            raise CalibrationError(f"Format koordinat tidak valid: '{pair}'. Gunakan format 'x,y'.")
+        coords.append((float(xy[0]), float(xy[1])))
+    return np.array(coords, dtype=np.float32)
+
+
+def parse_wx_h(size_str: str, sep: str = "x") -> Tuple[float, float]:
+    parts = size_str.lower().split(sep)
+    if len(parts) != 2:
+        raise CalibrationError(f"Format ukuran tidak valid: '{size_str}'. Gunakan format 'WxH'.")
+    return float(parts[0]), float(parts[1])
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Konversi Presisi Tinggi Gambar 2D (JPG/PNG) ke Model 3D (.STL, .OBJ, .DAE, .PLY)",
+        description="Konversi Presisi Tinggi Gambar 2D ke Model 3D dengan Kalibrasi Intrinsik & Homografi 4-Titik",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
+    # --- Sub-Mode Utilitas: Kalibrasi Kamera Papan Catur ---
+    calib_group = parser.add_argument_group("Kalibrasi Matriks Intrinsik Kamera (Tahap 0A)")
+    calib_group.add_argument(
+        "--calibrate-chessboard",
+        nargs="+",
+        help="Folder/daftar foto papan catur untuk menghitung matriks intrinsik kamera K & distorsi",
+    )
+    calib_group.add_argument(
+        "--chessboard-size",
+        type=str,
+        default="9x6",
+        help="Jumlah sudut dalam papan catur (KolomxBaris, mis. 9x6)",
+    )
+    calib_group.add_argument(
+        "--square-size",
+        type=float,
+        default=25.0,
+        help="Ukuran sisi satu kotak papan catur dalam satuan nyata (mis. 25.0 mm)",
+    )
+    calib_group.add_argument(
+        "--save-calib",
+        type=Path,
+        default=Path("./camera_intrinsics.json"),
+        help="Path file JSON keluaran hasil kalibrasi kamera",
+    )
+    calib_group.add_argument(
+        "--camera-calib",
+        type=Path,
+        default=None,
+        help="Path file JSON kalibrasi intrinsik kamera untuk menghilangkan distorsi lensa",
+    )
+    calib_group.add_argument(
+        "--intrinsics-manual",
+        type=str,
+        default=None,
+        help="Parameter intrinsik manual 'fx,fy,cx,cy,k1,k2,p1,p2[,k3]' jika tidak memakai JSON",
+    )
+
+    # --- Sub-Mode Koreksi Perspektif Homografi 4-Titik ---
+    homo_group = parser.add_argument_group("Koreksi Perspektif Homografi 4-Titik (Tahap 0B)")
+    homo_group.add_argument(
+        "--homography-points",
+        type=str,
+        default=None,
+        help="4 titik sudut referensi piksel 'x1,y1;x2,y2;x3,y3;x4,y4' berurutan [TL, TR, BR, BL]",
+    )
+    homo_group.add_argument(
+        "--pick-points",
+        action="store_true",
+        help="Pilih 4 titik sudut referensi secara interaktif dengan klik mouse pada gambar",
+    )
+    homo_group.add_argument(
+        "--homography-size",
+        type=str,
+        default=None,
+        help="Dimensi fisik nyata bidang 4 titik 'LebarxTinggi' dalam satuan --unit (mis. 210x297 untuk A4 mm)",
+    )
+    homo_group.add_argument(
+        "--homography-crop",
+        action="store_true",
+        help="Potong output hanya di dalam area 4 titik (default: pertahankan seluruh kanvas)",
+    )
+
+    # --- Input & Rekonstruksi Utama ---
     parser.add_argument(
         "-i", "--input",
         nargs="+",
-        required=True,
         help="Path 1 file gambar, beberapa file gambar, folder, atau wildcard (mis. *.png)",
     )
     parser.add_argument(
@@ -1175,18 +1590,17 @@ def parse_args() -> PipelineConfig:
         default="batch",
         help="Strategi multi-file: 'batch' (terpisah), 'stack' (tumpuk layer Z di Mode A), 'merge' (ICP Mode B)",
     )
-    # Parameter Kalibrasi Skala
     parser.add_argument(
         "--ref-real-size",
         type=float,
-        required=True,
-        help="Ukuran fisik referensi nyata (misal: 100.0 untuk 100 mm)",
+        default=None,
+        help="Ukuran fisik referensi nyata (wajib jika tidak menggunakan --homography-size)",
     )
     parser.add_argument(
         "--ref-pixels",
         type=float,
-        required=True,
-        help="Panjang objek referensi pada gambar dalam satuan piksel (misal: 500.0)",
+        default=None,
+        help="Panjang objek referensi dalam piksel (wajib jika tidak menggunakan --homography-size)",
     )
     parser.add_argument(
         "--unit",
@@ -1205,26 +1619,9 @@ def parse_args() -> PipelineConfig:
         action="store_true",
         help="Balik polaritas objek (objek terang di atas latar gelap)",
     )
-    # Parameter Mode A (CAD)
-    parser.add_argument(
-        "--rdp-epsilon",
-        type=float,
-        default=0.35,
-        help="Toleransi error Ramer-Douglas-Peucker dalam piksel (Mode A)",
-    )
-    parser.add_argument(
-        "--min-area",
-        type=float,
-        default=25.0,
-        help="Luas kontur minimum dalam piksel persegi untuk memfilter noise (Mode A)",
-    )
-    parser.add_argument(
-        "--layer-gap",
-        type=float,
-        default=0.0,
-        help="Jarak celah antar layer saat menggunakan --multi-strategy stack",
-    )
-    # Parameter Mode B (Surface / Relief)
+    parser.add_argument("--rdp-epsilon", type=float, default=0.35, help="Toleransi Ramer-Douglas-Peucker (px)")
+    parser.add_argument("--min-area", type=float, default=25.0, help="Luas kontur minimum (px^2)")
+    parser.add_argument("--layer-gap", type=float, default=0.0, help="Celah antar layer pada mode stack")
     parser.add_argument(
         "--depth-backend",
         choices=["heightmap", "depth-anything", "midas"],
@@ -1237,71 +1634,115 @@ def parse_args() -> PipelineConfig:
         default="poisson",
         help="Algoritma rekonstruksi permukaan untuk Mode B",
     )
-    parser.add_argument(
-        "--poisson-depth",
-        type=int,
-        default=9,
-        help="Kedalaman octree Screened Poisson Surface Reconstruction (8-11)",
-    )
-    parser.add_argument(
-        "--no-solid-base",
-        action="store_true",
-        help="Jangan tutup alas bawah Z=0 pada Mode B (menghasilkan open surface mesh)",
-    )
-    # Parameter Optimasi Mesh
-    parser.add_argument(
-        "--taubin-iter",
-        type=int,
-        default=5,
-        help="Jumlah iterasi Taubin smoothing pada Mode B",
-    )
-    parser.add_argument(
-        "--decimate",
-        type=float,
-        default=0.0,
-        help="Rasio reduksi segitiga (0.0 - 0.90) dengan quadric edge collapse",
-    )
+    parser.add_argument("--poisson-depth", type=int, default=9, help="Kedalaman octree Poisson (8-11)")
+    parser.add_argument("--no-solid-base", action="store_true", help="Jangan tutup alas bawah Z=0 pada Mode B")
+    parser.add_argument("--taubin-iter", type=int, default=5, help="Iterasi Taubin smoothing pada Mode B")
+    parser.add_argument("--decimate", type=float, default=0.0, help="Rasio reduksi segitiga (0.0 - 0.90)")
 
     args = parser.parse_args()
-    input_files = resolve_input_files(args.input)
 
-    calib = CalibrationConfig(
-        ref_real_size=args.ref_real_size,
-        ref_pixels=args.ref_pixels,
-        unit=args.unit,
-        extrude_height=args.extrude_height,
-        invert_polarity=args.invert,
-    )
-
-    return PipelineConfig(
-        input_paths=input_files,
-        output_dir=args.output_dir,
-        mode=args.mode,
-        multi_strategy=args.multi_strategy,
-        calibration=calib,
-        rdp_epsilon_px=args.rdp_epsilon,
-        min_contour_area_px=args.min_area,
-        layer_gap=args.layer_gap,
-        depth_backend=args.depth_backend,
-        surface_method=args.surface_method,
-        poisson_depth=args.poisson_depth,
-        close_solid_base=not args.no_solid_base,
-        taubin_iterations=args.taubin_iter,
-        target_reduction=args.decimate,
-    )
-
-
-def main() -> int:
     try:
-        config = parse_args()
-        logger.info(
-            "Skala Kalibrasi Terhitung: 1 piksel = %.6f %s",
-            config.calibration.scale_per_pixel,
-            config.calibration.unit,
+        # 1. Jalankan mode kalibrasi papan catur jika diminta
+        if args.calibrate_chessboard:
+            calib_imgs = resolve_input_files(args.calibrate_chessboard)
+            cols_f, rows_f = parse_wx_h(args.chessboard_size)
+            CameraIntrinsicsCalibrator.calibrate_from_chessboard(
+                image_paths=calib_imgs,
+                board_size=(int(cols_f), int(rows_f)),
+                square_size=args.square_size,
+                save_path=args.save_calib,
+            )
+            if not args.input:
+                return 0
+
+        if not args.input:
+            raise CalibrationError("Argumen --input wajib diisi untuk menjalankan rekonstruksi 3D.")
+
+        input_files = resolve_input_files(args.input)
+
+        # 2. Muat parameter matriks intrinsik kamera (jika tersedia)
+        intrinsics_cfg: Optional[CameraIntrinsicsConfig] = None
+        if args.camera_calib is not None:
+            intrinsics_cfg = CameraIntrinsicsConfig.from_json(args.camera_calib)
+        elif args.intrinsics_manual is not None:
+            vals = [float(v.strip()) for v in args.intrinsics_manual.split(",") if v.strip()]
+            if len(vals) < 8:
+                raise CalibrationError(
+                    "--intrinsics-manual membutuhkan minimal 8 nilai: fx,fy,cx,cy,k1,k2,p1,p2[,k3]."
+                )
+            intrinsics_cfg = CameraIntrinsicsConfig.from_manual_params(
+                fx=vals[0], fy=vals[1], cx=vals[2], cy=vals[3], dist_coeffs=vals[4:]
+            )
+
+        # 3. Konfigurasi Homografi 4-Titik (jika diaktifkan)
+        homography_cfg: Optional[HomographyConfig] = None
+        if args.homography_points is not None or args.pick_points:
+            if args.homography_size is None:
+                raise CalibrationError(
+                    "--homography-size (mis. 210x297) wajib diisi saat menggunakan homografi 4-titik."
+                )
+            h_w, h_h = parse_wx_h(args.homography_size)
+            # Jika --pick-points dipakai tanpa --homography-points, inisialisasi dummy yang akan diganti GUI
+            pts = (
+                parse_points_string(args.homography_points)
+                if args.homography_points is not None
+                else np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+            )
+            homography_cfg = HomographyConfig(
+                src_points=pts,
+                rect_real_width=h_w,
+                rect_real_height=h_h,
+                keep_full_canvas=not args.homography_crop,
+            )
+
+        # 4. Validasi Kalibrasi Skala Metrik
+        if homography_cfg is not None:
+            # Nilai awal sementara; akan ditimpa presisi 1:1 oleh HomographyPerspectiveRectifier
+            calib_cfg = CalibrationConfig(
+                ref_real_size=1.0,
+                ref_pixels=1.0,
+                unit=args.unit,
+                extrude_height=args.extrude_height,
+                invert_polarity=args.invert,
+            )
+        else:
+            if args.ref_real_size is None or args.ref_pixels is None:
+                raise CalibrationError(
+                    "Isi --ref-real-size dan --ref-pixels, ATAU aktifkan homografi 4-titik "
+                    "(--homography-points / --pick-points + --homography-size)."
+                )
+            calib_cfg = CalibrationConfig(
+                ref_real_size=args.ref_real_size,
+                ref_pixels=args.ref_pixels,
+                unit=args.unit,
+                extrude_height=args.extrude_height,
+                invert_polarity=args.invert,
+            )
+
+        config = PipelineConfig(
+            input_paths=input_files,
+            output_dir=args.output_dir,
+            mode=args.mode,
+            multi_strategy=args.multi_strategy,
+            calibration=calib_cfg,
+            camera_intrinsics=intrinsics_cfg,
+            homography=homography_cfg,
+            interactive_pick_points=args.pick_points,
+            rdp_epsilon_px=args.rdp_epsilon,
+            min_contour_area_px=args.min_area,
+            layer_gap=args.layer_gap,
+            depth_backend=args.depth_backend,
+            surface_method=args.surface_method,
+            poisson_depth=args.poisson_depth,
+            close_solid_base=not args.no_solid_base,
+            taubin_iterations=args.taubin_iter,
+            target_reduction=args.decimate,
         )
+
         pipeline = ImageTo3DPipeline(config)
         pipeline.run()
         return 0
+
     except PipelineError as exc:
         logger.error("Kesalahan Pipeline Geometri: %s", exc)
         return 1
