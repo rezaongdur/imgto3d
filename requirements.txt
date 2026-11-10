@@ -10,7 +10,8 @@ pycollada>=0.8
 lxml>=5.1.0
 mapbox-earcut 
 manifold3d
-
+triangle
+mapbox_earcut
 
 # === Optional: Deep Learning Monocular Depth (Mode B) ===
 # Hapus tanda komentar (#) jika menggunakan backend 'depth-anything' atau 'midas'
