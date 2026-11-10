@@ -12,6 +12,7 @@ mapbox-earcut
 manifold3d
 triangle
 mapbox_earcut
+networkx
 
 # === Optional: Deep Learning Monocular Depth (Mode B) ===
 # Hapus tanda komentar (#) jika menggunakan backend 'depth-anything' atau 'midas'
