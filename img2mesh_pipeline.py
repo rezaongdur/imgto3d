@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 End-to-End 2D Image(s) to Calibrated 3D Solid Mesh Reconstruction Pipeline
-(Dilengkapi Kalibrasi Intrinsik Kamera, Homografi 4-Titik, & Open3D Interactive Preview).
+(Dengan Multi-Color CAD Layer Extrusion, Kalibrasi Intrinsik, Homografi 4-Titik,
+Open3D Interactive Preview, dan Dokumentasi CLI --help Terstruktur).
 
 Tahapan Pipeline:
   - Tahap 0A: Kalibrasi & Undistorsi Matriks Intrinsik Kamera (Brown-Conrady / Zhang)
   - Tahap 0B: Koreksi Perspektif Homografi 4-Titik (Metric Bird's-Eye Rectification)
   - Tahap 1 : Preprocessing Adaptif (CLAHE + Bilateral Filter) & Kalibrasi Skala 1:1
-  - Tahap 2 : Rekonstruksi 3D Mode A (CAD Kontur Sub-Piksel + Ekstrusi) atau
-              Mode B (Depth Anything V2 / MiDaS / Heightmap + Poisson / Alpha Shapes)
+  - Tahap 2 : Rekonstruksi 3D Mode A (Single-Layer atau Multi-Color Multi-Height CAD)
+              atau Mode B (Depth Anything V2 / MiDaS / Heightmap + Poisson / Alpha Shapes)
   - Tahap 3 : Mesh Cleaning & Topology Optimization (Watertight, Manifold, Taubin)
-  - Tahap 4 : Ekspor Multi-Format (.STL, .OBJ + .MTL, .DAE Z-up SketchUp, .PLY)
+  - Tahap 4 : Ekspor Multi-Format (.STL, .OBJ + Multi-Material .MTL, .DAE SketchUp, .PLY)
   - Tahap 5 : Validasi Dimensi Fisik, Integritas Topologi Euler, & Pratinjau 3D Open3D
 """
 
@@ -23,6 +24,7 @@ import logging
 import math
 import os
 import sys
+import textwrap
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,8 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 from shapely.validation import make_valid
+
+__version__ = "2.4.0"
 
 # ==============================================================================
 # KONFIGURASI LOGGING & CUSTOM EXCEPTIONS
@@ -66,6 +70,52 @@ class MeshTopologyError(PipelineError):
 
 
 # ==============================================================================
+# UTILITAS KOLORIMETRI PERSEPTUAL (RGB <-> CIE L*a*b*)
+# ==============================================================================
+
+
+def hex_to_rgb(hex_str: str) -> Tuple[int, int, int]:
+    """Mengonversi string warna HEX ('#FF0000' atau 'FF0000') menjadi tuple (R, G, B)."""
+    cleaned = hex_str.strip().lstrip("#")
+    if len(cleaned) == 3:
+        cleaned = "".join(ch * 2 for ch in cleaned)
+    if len(cleaned) != 6:
+        raise CalibrationError(f"Format warna HEX tidak valid: '{hex_str}'. Gunakan '#RRGGBB'.")
+    try:
+        r = int(cleaned[0:2], 16)
+        g = int(cleaned[2:4], 16)
+        b = int(cleaned[4:6], 16)
+        return (r, g, b)
+    except ValueError as exc:
+        raise CalibrationError(f"Nilai heksadesimal warna tidak valid: '{hex_str}'.") from exc
+
+
+def rgb_array_to_cie_lab(rgb_arr: np.ndarray) -> np.ndarray:
+    """
+    Mengonversi array uint8 RGB (..., 3) ke skala perseptual CIE L*a*b* standar:
+      L* in [0, 100], a* in [-128, 127], b* in [-128, 127].
+    """
+    orig_shape = rgb_arr.shape
+    flat_rgb = rgb_arr.reshape(-1, 1, 3).astype(np.uint8)
+    lab_cv = cv2.cvtColor(flat_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_cie = np.empty_like(lab_cv)
+    lab_cie[:, :, 0] = lab_cv[:, :, 0] * (100.0 / 255.0)
+    lab_cie[:, :, 1] = lab_cv[:, :, 1] - 128.0
+    lab_cie[:, :, 2] = lab_cv[:, :, 2] - 128.0
+    return lab_cie.reshape(orig_shape)
+
+
+def cie_lab_to_rgb_tuple(lab_vec: np.ndarray) -> Tuple[int, int, int]:
+    """Mengonversi vektor tunggal CIE L*a*b* standar kembali ke tuple uint8 (R, G, B)."""
+    l_cv = np.clip(round(float(lab_vec[0]) * (255.0 / 100.0)), 0, 255)
+    a_cv = np.clip(round(float(lab_vec[1]) + 128.0), 0, 255)
+    b_cv = np.clip(round(float(lab_vec[2]) + 128.0), 0, 255)
+    pixel_lab = np.array([[[l_cv, a_cv, b_cv]]], dtype=np.uint8)
+    rgb = cv2.cvtColor(pixel_lab, cv2.COLOR_LAB2RGB)[0, 0]
+    return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+# ==============================================================================
 # STRUKTUR DATA KONFIGURASI & LAPORAN VALIDASI
 # ==============================================================================
 
@@ -77,13 +127,51 @@ SurfaceMethod = Literal["poisson", "alpha", "grid-solid"]
 
 
 @dataclass
+class ColorLayerRule:
+    """Aturan ekstrusi 3D untuk satu segmen warna pada denah 2D."""
+
+    name: str
+    rgb: Tuple[int, int, int]
+    extrude_height: float
+    z_base: float = 0.0
+    lab: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.extrude_height <= 0.0:
+            raise CalibrationError(
+                f"Tinggi ekstrusi untuk layer '{self.name}' harus lebih besar dari 0."
+            )
+        rgb_np = np.array([[self.rgb]], dtype=np.uint8)
+        self.lab = rgb_array_to_cie_lab(rgb_np)[0, 0]
+
+    @property
+    def hex_code(self) -> str:
+        return f"#{self.rgb[0]:02X}{self.rgb[1]:02X}{self.rgb[2]:02X}"
+
+
+@dataclass
+class ColorCadConfig:
+    """Konfigurasi segmentasi warna otomatis / eksplisit pada Mode A."""
+
+    rules: List[ColorLayerRule] = field(default_factory=list)
+    auto_num_colors: Optional[int] = None
+    auto_heights: Optional[List[float]] = None
+    delta_e_tolerance: float = 22.0
+    bg_delta_e_threshold: float = 15.0
+
+    @property
+    def is_enabled(self) -> bool:
+        return len(self.rules) > 0 or (self.auto_num_colors is not None and self.auto_num_colors >= 1)
+
+
+@dataclass
 class CameraIntrinsicsConfig:
     """Parameter matriks intrinsik kamera K dan koefisien distorsi lensa."""
 
-    camera_matrix: np.ndarray  # Bentuk (3, 3) float64
-    dist_coeffs: np.ndarray    # Bentuk (N,) float64: [k1, k2, p1, p2, k3]
-    calib_image_size: Optional[Tuple[int, int]] = None  # (width, height) saat kalibrasi
-    alpha: float = 0.0  # 0.0 = crop piksel hitam tepi, 1.0 = pertahankan semua piksel
+    camera_matrix: np.ndarray
+    dist_coeffs: np.ndarray
+    calib_image_size: Optional[Tuple[int, int]] = None
+    alpha: float = 0.0
 
     def __post_init__(self) -> None:
         self.camera_matrix = np.asarray(self.camera_matrix, dtype=np.float64)
@@ -136,11 +224,11 @@ class CameraIntrinsicsConfig:
 class HomographyConfig:
     """Konfigurasi rektifikasi perspektif 4-titik ke bidang ortografis 1:1."""
 
-    src_points: np.ndarray        # Bentuk (4, 2) float32: [TL, TR, BR, BL] dalam piksel
-    rect_real_width: float        # Lebar fisik nyata bidang referensi (dalam satuan unit)
-    rect_real_height: float       # Tinggi fisik nyata bidang referensi (dalam satuan unit)
-    keep_full_canvas: bool = True # True = warp seluruh kanvas, False = crop ke 4 titik
-    target_ppu: Optional[float] = None  # Piksel per unit fisik (None = hitung otomatis)
+    src_points: np.ndarray
+    rect_real_width: float
+    rect_real_height: float
+    keep_full_canvas: bool = True
+    target_ppu: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.src_points = np.asarray(self.src_points, dtype=np.float32)
@@ -179,12 +267,10 @@ class CalibrationConfig:
 
     @property
     def scale_per_pixel(self) -> float:
-        """Mengembalikan faktor konversi fisik (unit dunia nyata per piksel)."""
         return self.ref_real_size / self.ref_pixels
 
     @property
     def meters_per_unit(self) -> float:
-        """Konversi unit ke meter untuk metadata COLLADA (.DAE)."""
         return {"mm": 0.001, "cm": 0.01, "m": 1.0}[self.unit]
 
 
@@ -224,10 +310,11 @@ class PipelineConfig:
     adaptive_block_size: int = 35
     adaptive_c: float = 5.0
     use_otsu: bool = True
-    # Tahap 2A: CAD Parameters
+    # Tahap 2A: CAD & Multi-Color Layer Parameters
     rdp_epsilon_px: float = 0.35
     min_contour_area_px: float = 25.0
     layer_gap: float = 0.0
+    color_cad: ColorCadConfig = field(default_factory=ColorCadConfig)
     # Tahap 2B: Surface / Relief Parameters
     depth_backend: DepthBackend = "heightmap"
     surface_method: SurfaceMethod = "poisson"
@@ -271,10 +358,7 @@ class ValidationReport:
 
 
 class CameraIntrinsicsCalibrator:
-    """
-    Menangani kalibrasi kamera Zhang menggunakan pola papan catur (chessboard)
-    serta koreksi distorsi radial dan tangensial pada citra input.
-    """
+    """Kalibrasi kamera Zhang (chessboard) dan koreksi distorsi lensa."""
 
     @staticmethod
     def calibrate_from_chessboard(
@@ -370,10 +454,9 @@ class CameraIntrinsicsCalibrator:
         map_x, map_y = cv2.initUndistortRectifyMap(
             k_mat, intrinsics.dist_coeffs, None, new_k, (w, h), m1type=cv2.CV_32FC1
         )
-        undistorted = cv2.remap(
+        return cv2.remap(
             img_bgr, map_x, map_y, interpolation=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE
         )
-        return undistorted
 
 
 # ==============================================================================
@@ -382,10 +465,7 @@ class CameraIntrinsicsCalibrator:
 
 
 class HomographyPerspectiveRectifier:
-    """
-    Meluruskan foto miring (oblique perspective) menjadi tampak atas ortografis
-    (bird's-eye view) 1:1 menggunakan transformasi homografi planar 4-titik.
-    """
+    """Meluruskan foto miring menjadi tampak atas ortografis 1:1 via homografi 4-titik."""
 
     @staticmethod
     def interactive_pick_4_points(
@@ -475,15 +555,9 @@ class HomographyPerspectiveRectifier:
         dst_h = h_cfg.rect_real_height * ppu
 
         dst_ref = np.array(
-            [
-                [0.0, 0.0],
-                [dst_w, 0.0],
-                [dst_w, dst_h],
-                [0.0, dst_h],
-            ],
+            [[0.0, 0.0], [dst_w, 0.0], [dst_w, dst_h], [0.0, dst_h]],
             dtype=np.float32,
         )
-
         h_mat = cv2.getPerspectiveTransform(src, dst_ref)
 
         if not h_cfg.keep_full_canvas:
@@ -513,16 +587,11 @@ class HomographyPerspectiveRectifier:
 
             if out_w > 12000 or out_h > 12000 or out_w <= 0 or out_h <= 0:
                 raise CalibrationError(
-                    f"Ukuran kanvas hasil homografi full-canvas tidak wajar ({out_w}x{out_h} px). "
-                    "Gunakan --homography-crop atau periksa urutan titik [TL, TR, BR, BL]."
+                    f"Ukuran kanvas hasil homografi full-canvas tidak wajar ({out_w}x{out_h} px)."
                 )
 
             t_mat = np.array(
-                [
-                    [1.0, 0.0, -min_xy[0]],
-                    [0.0, 1.0, -min_xy[1]],
-                    [0.0, 0.0, 1.0],
-                ],
+                [[1.0, 0.0, -min_xy[0]], [0.0, 1.0, -min_xy[1]], [0.0, 0.0, 1.0]],
                 dtype=np.float64,
             )
             final_h = t_mat @ h_mat
@@ -551,10 +620,7 @@ class HomographyPerspectiveRectifier:
 
 
 class ImagePreprocessor:
-    """
-    Menangani pemuatan citra, koreksi lensa & perspektif (Tahap 0),
-    koreksi kontras adaptif CLAHE, bilateral filtering, dan binarisasi.
-    """
+    """Menangani pemuatan citra, koreksi lensa/perspektif, CLAHE, bilateral filter, dan binarisasi."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
@@ -570,8 +636,9 @@ class ImagePreprocessor:
         if img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
             alpha = img_bgr[:, :, 3:4].astype(np.float32) / 255.0
             bgr = img_bgr[:, :, :3].astype(np.float32)
-            white_bg = np.full_like(bgr, 255.0)
-            img_bgr = np.clip(bgr * alpha + white_bg * (1.0 - alpha), 0, 255).astype(np.uint8)
+            bg_val = 0.0 if self.cfg.calibration.invert_polarity else 255.0
+            bg_canvas = np.full_like(bgr, bg_val)
+            img_bgr = np.clip(bgr * alpha + bg_canvas * (1.0 - alpha), 0, 255).astype(np.uint8)
         elif img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
 
@@ -604,13 +671,20 @@ class ImagePreprocessor:
         bgr_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
         gray = cv2.cvtColor(bgr_enhanced, cv2.COLOR_BGR2GRAY)
 
-        denoised = cv2.bilateralFilter(
+        return cv2.bilateralFilter(
             gray,
             d=self.cfg.bilateral_d,
             sigmaColor=self.cfg.bilateral_sigma_color,
             sigmaSpace=self.cfg.bilateral_sigma_space,
         )
-        return denoised
+
+    def enhance_color_preserve_edges(self, img_bgr: np.ndarray) -> np.ndarray:
+        return cv2.bilateralFilter(
+            img_bgr,
+            d=self.cfg.bilateral_d,
+            sigmaColor=self.cfg.bilateral_sigma_color,
+            sigmaSpace=self.cfg.bilateral_sigma_space,
+        )
 
     def binarize_high_precision(self, denoised_gray: np.ndarray) -> np.ndarray:
         if self.cfg.use_otsu:
@@ -636,24 +710,170 @@ class ImagePreprocessor:
             )
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return binary
+        return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
 
 # ==============================================================================
-# TAHAP 2A: REKONSTRUKSI CAD / ORTOGRAFIS (SUB-PIXEL CONTOUR + EXTRUSION)
+# TAHAP 2A: REKONSTRUKSI CAD / ORTOGRAFIS (SINGLE & MULTI-COLOR MULTI-HEIGHT Z)
 # ==============================================================================
+
+
+class ColorCadLayerSegmenter:
+    """
+    Mengelompokkan segmen warna berbeda pada denah 2D dalam ruang perseptual
+    CIE L*a*b* dan menghasilkan mask biner presisi untuk tiap aturan tinggi Z.
+    """
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.cfg = config
+        self.c_cfg = config.color_cad
+
+    def _detect_background_lab(self, lab_img: np.ndarray) -> np.ndarray:
+        top = lab_img[0, :, :]
+        bot = lab_img[-1, :, :]
+        left = lab_img[:, 0, :]
+        right = lab_img[:, -1, :]
+        border_pixels = np.vstack([top, bot, left, right])
+        return np.median(border_pixels, axis=0)
+
+    def _discover_auto_color_rules(
+        self, fg_lab_pixels: np.ndarray
+    ) -> List[ColorLayerRule]:
+        k = int(self.c_cfg.auto_num_colors or 1)
+        if len(fg_lab_pixels) < k:
+            raise GeometryExtractionError(
+                f"Piksel latar depan terlalu sedikit ({len(fg_lab_pixels)}) untuk {k} klaster warna."
+            )
+
+        max_samples = 60000
+        if len(fg_lab_pixels) > max_samples:
+            step = len(fg_lab_pixels) // max_samples
+            samples = fg_lab_pixels[::step].astype(np.float32)
+        else:
+            samples = fg_lab_pixels.astype(np.float32)
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.2)
+        _, _, centers = cv2.kmeans(
+            samples,
+            K=k,
+            bestLabels=None,
+            criteria=criteria,
+            attempts=5,
+            flags=cv2.KMEANS_PP_CENTERS,
+        )
+
+        order = sorted(
+            range(k),
+            key=lambda idx: (round(float(centers[idx][0]), 1), float(centers[idx][1]), float(centers[idx][2])),
+        )
+
+        base_max_h = self.cfg.calibration.extrude_height
+        custom_heights = self.c_cfg.auto_heights or []
+
+        rules: List[ColorLayerRule] = []
+        for rank, c_idx in enumerate(order):
+            center_lab = centers[c_idx]
+            rgb_tuple = cie_lab_to_rgb_tuple(center_lab)
+            if rank < len(custom_heights):
+                h_val = float(custom_heights[rank])
+            else:
+                factor = 1.0 - (0.75 * rank / max(1, k - 1)) if k > 1 else 1.0
+                h_val = max(0.05, round(base_max_h * factor, 4))
+
+            rule = ColorLayerRule(
+                name=f"AutoColor_{rank + 1}_{rgb_tuple[0]:02X}{rgb_tuple[1]:02X}{rgb_tuple[2]:02X}",
+                rgb=rgb_tuple,
+                extrude_height=h_val,
+                z_base=0.0,
+            )
+            rules.append(rule)
+
+        return rules
+
+    def segment_layers(
+        self, denoised_bgr: np.ndarray
+    ) -> List[Tuple[ColorLayerRule, np.ndarray]]:
+        img_rgb = cv2.cvtColor(denoised_bgr, cv2.COLOR_BGR2RGB)
+        lab_img = rgb_array_to_cie_lab(img_rgb)
+        h, w = lab_img.shape[:2]
+
+        bg_lab = self._detect_background_lab(lab_img)
+        diff_bg = lab_img - bg_lab.reshape(1, 1, 3)
+        delta_e_bg = np.linalg.norm(diff_bg, axis=-1)
+
+        fg_mask = delta_e_bg > self.c_cfg.bg_delta_e_threshold
+        fg_pixels_lab = lab_img[fg_mask]
+        if len(fg_pixels_lab) == 0:
+            raise GeometryExtractionError(
+                "Tidak ditemukan piksel warna latar depan yang berbeda dari warna latar belakang."
+            )
+
+        if len(self.c_cfg.rules) > 0:
+            active_rules = self.c_cfg.rules
+        else:
+            active_rules = self._discover_auto_color_rules(fg_pixels_lab)
+
+        centroids_lab = np.stack([r.lab for r in active_rules], axis=0)
+        dists = np.linalg.norm(
+            fg_pixels_lab[:, None, :] - centroids_lab[None, :, :],
+            axis=-1,
+        )
+        nearest_idx = np.argmin(dists, axis=1)
+        nearest_dist = dists[np.arange(len(fg_pixels_lab)), nearest_idx]
+        valid_fg = nearest_dist <= self.c_cfg.delta_e_tolerance
+
+        fg_rows, fg_cols = np.where(fg_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        segmented_layers: List[Tuple[ColorLayerRule, np.ndarray]] = []
+
+        logger.info("Segmentasi Multi-Warna CAD Aktif (%d aturan warna):", len(active_rules))
+        for k_idx, rule in enumerate(active_rules):
+            layer_mask = np.zeros((h, w), dtype=np.uint8)
+            sel = valid_fg & (nearest_idx == k_idx)
+            layer_mask[fg_rows[sel], fg_cols[sel]] = 255
+            layer_mask = cv2.morphologyEx(layer_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            px_count = int(np.count_nonzero(layer_mask))
+            logger.info(
+                "  Layer %-18s | HEX: %s | RGB: %-15s | Z_base: %.3f | Tinggi Z: %.3f %s | Piksel: %d",
+                rule.name,
+                rule.hex_code,
+                str(rule.rgb),
+                rule.z_base,
+                rule.extrude_height,
+                self.cfg.calibration.unit,
+                px_count,
+            )
+            if px_count >= self.cfg.min_contour_area_px:
+                segmented_layers.append((rule, layer_mask))
+            else:
+                logger.warning(
+                    "  Layer '%s' (%s) dilewati karena luas piksel (%d) < min_area (%d).",
+                    rule.name,
+                    rule.hex_code,
+                    px_count,
+                    int(self.cfg.min_contour_area_px),
+                )
+
+        if not segmented_layers:
+            raise GeometryExtractionError(
+                "Tidak ada segmen warna yang cocok dalam batas toleransi --color-tolerance. "
+                "Periksa kode HEX atau naikkan --color-tolerance."
+            )
+
+        return segmented_layers
 
 
 class CadOrthographicReconstructor:
     """
-    Mode A: Mengubah citra biner terkalibrasi menjadi mesh solid CAD 3D
-    menggunakan ekstraksi kontur hierarkis, Ramer-Douglas-Peucker,
+    Mode A: Mengubah citra CAD (tunggal maupun multi-warna) menjadi mesh solid 3D
+    watertight menggunakan ekstraksi kontur hierarkis, Ramer-Douglas-Peucker,
     validasi poligon Shapely, dan triangulasi CDT Trimesh.
     """
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
+        self.color_segmenter = ColorCadLayerSegmenter(config)
 
     def _refine_contours_subpixel(
         self, gray_img: np.ndarray, contours: Sequence[np.ndarray]
@@ -680,7 +900,7 @@ class CadOrthographicReconstructor:
         return refined
 
     def _extract_shapely_polygons(
-        self, binary_mask: np.ndarray, denoised_gray: np.ndarray
+        self, binary_mask: np.ndarray, ref_gray: np.ndarray
     ) -> List[Polygon]:
         h, _ = binary_mask.shape[:2]
         scale = self.cfg.calibration.scale_per_pixel
@@ -689,9 +909,7 @@ class CadOrthographicReconstructor:
             binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
         )
         if not contours or hierarchy is None:
-            raise GeometryExtractionError(
-                "Tidak ditemukan kontur geometris pada gambar. Periksa polaritas binarization (--invert)."
-            )
+            return []
 
         hier = hierarchy[0]
         raw_polygons: List[Polygon] = []
@@ -705,7 +923,7 @@ class CadOrthographicReconstructor:
                 continue
 
             approx_ext = cv2.approxPolyDP(cnt, epsilon=self.cfg.rdp_epsilon_px, closed=True)
-            refined_ext = self._refine_contours_subpixel(denoised_gray, [approx_ext])
+            refined_ext = self._refine_contours_subpixel(ref_gray, [approx_ext])
             if not refined_ext or len(refined_ext[0]) < 3:
                 continue
 
@@ -720,7 +938,7 @@ class CadOrthographicReconstructor:
                     approx_hole = cv2.approxPolyDP(
                         hole_cnt, epsilon=self.cfg.rdp_epsilon_px, closed=True
                     )
-                    refined_hole = self._refine_contours_subpixel(denoised_gray, [approx_hole])
+                    refined_hole = self._refine_contours_subpixel(ref_gray, [approx_hole])
                     if refined_hole and len(refined_hole[0]) >= 3:
                         h_pts = refined_hole[0]
                         holes_coords.append(
@@ -739,44 +957,80 @@ class CadOrthographicReconstructor:
                     if isinstance(geom, Polygon) and geom.area > 0:
                         raw_polygons.append(geom)
 
-        if not raw_polygons:
-            raise GeometryExtractionError(
-                "Seluruh kontur terfilter oleh ambang luas minimum atau tidak valid secara topologis."
-            )
-
         return raw_polygons
+
+    def _extrude_mask_to_mesh(
+        self,
+        binary_mask: np.ndarray,
+        ref_gray: np.ndarray,
+        extrude_height: float,
+        z_base: float,
+        layer_rgb: Optional[Tuple[int, int, int]] = None,
+        source_img_rgb: Optional[np.ndarray] = None,
+    ) -> List[trimesh.Trimesh]:
+        polygons = self._extract_shapely_polygons(binary_mask, ref_gray)
+        parts: List[trimesh.Trimesh] = []
+
+        for poly in polygons:
+            try:
+                mesh_part = trimesh.creation.extrude_polygon(poly, height=extrude_height)
+                if z_base != 0.0:
+                    mesh_part.apply_translation([0.0, 0.0, z_base])
+
+                if layer_rgb is not None:
+                    rgba = np.array(
+                        [[layer_rgb[0], layer_rgb[1], layer_rgb[2], 255]],
+                        dtype=np.uint8,
+                    )
+                    mesh_part.visual.vertex_colors = np.repeat(rgba, len(mesh_part.vertices), axis=0)
+                elif source_img_rgb is not None:
+                    self._apply_projected_vertex_colors(mesh_part, source_img_rgb)
+
+                parts.append(mesh_part)
+            except Exception as exc:
+                logger.warning("Melewati satu sub-poligon karena gagal triangulasi CDT: %s", exc)
+
+        return parts
 
     def reconstruct(
         self,
         binary_mask: np.ndarray,
         denoised_gray: np.ndarray,
+        denoised_bgr: np.ndarray,
         img_rgb: np.ndarray,
         z_offset: float = 0.0,
     ) -> trimesh.Trimesh:
-        polygons = self._extract_shapely_polygons(binary_mask, denoised_gray)
-        extruded_parts: List[trimesh.Trimesh] = []
-        height = self.cfg.calibration.extrude_height
+        all_parts: List[trimesh.Trimesh] = []
 
-        for poly in polygons:
-            try:
-                mesh_part = trimesh.creation.extrude_polygon(poly, height=height)
-                if z_offset != 0.0:
-                    mesh_part.apply_translation([0.0, 0.0, z_offset])
-                extruded_parts.append(mesh_part)
-            except Exception as exc:
-                logger.warning("Melewati satu sub-poligon karena gagal triangulasi CDT: %s", exc)
+        if self.cfg.color_cad.is_enabled:
+            color_layers = self.color_segmenter.segment_layers(denoised_bgr)
+            for rule, layer_mask in color_layers:
+                layer_parts = self._extrude_mask_to_mesh(
+                    binary_mask=layer_mask,
+                    ref_gray=denoised_gray,
+                    extrude_height=rule.extrude_height,
+                    z_base=z_offset + rule.z_base,
+                    layer_rgb=rule.rgb,
+                )
+                if not layer_parts:
+                    logger.warning("Layer warna %s tidak menghasilkan poligon solid valid.", rule.hex_code)
+                all_parts.extend(layer_parts)
+        else:
+            all_parts = self._extrude_mask_to_mesh(
+                binary_mask=binary_mask,
+                ref_gray=denoised_gray,
+                extrude_height=self.cfg.calibration.extrude_height,
+                z_base=z_offset,
+                source_img_rgb=img_rgb,
+            )
 
-        if not extruded_parts:
-            raise GeometryExtractionError("Gagal melakukan ekstrusi 3D pada seluruh poligon.")
+        if not all_parts:
+            raise GeometryExtractionError(
+                "Tidak ditemukan kontur geometris valid untuk diekstrusi ke 3D. "
+                "Periksa polaritas binarization (--invert) atau toleransi warna."
+            )
 
-        combined = (
-            extruded_parts[0]
-            if len(extruded_parts) == 1
-            else trimesh.util.concatenate(extruded_parts)
-        )
-
-        self._apply_projected_vertex_colors(combined, img_rgb)
-        return combined
+        return all_parts[0] if len(all_parts) == 1 else trimesh.util.concatenate(all_parts)
 
     def _apply_projected_vertex_colors(self, mesh: trimesh.Trimesh, img_rgb: np.ndarray) -> None:
         h, w = img_rgb.shape[:2]
@@ -1112,16 +1366,23 @@ class MeshTopologyOptimizer:
         if final_tm.is_watertight and final_tm.volume < 0:
             final_tm.invert()
 
-        # Sinkronkan kembali normal dan orientasi segitiga final ke o3d_mesh untuk pratinjau & PLY
         o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(final_tm.vertices, dtype=np.float64))
         o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(final_tm.faces, dtype=np.int32))
+        if (
+            hasattr(final_tm.visual, "vertex_colors")
+            and final_tm.visual.vertex_colors is not None
+            and len(final_tm.visual.vertex_colors) == len(final_tm.vertices)
+        ):
+            o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(
+                np.asarray(final_tm.visual.vertex_colors[:, :3], dtype=np.float64) / 255.0
+            )
         o3d_mesh.compute_vertex_normals()
 
         return final_tm, o3d_mesh
 
 
 # ==============================================================================
-# TAHAP 4: MULTI-FORMAT EXPORTER (.STL, .OBJ + .MTL, .DAE SKETCHUP, .PLY)
+# TAHAP 4: MULTI-FORMAT EXPORTER (.STL, .OBJ + MULTI-MATERIAL .MTL, .DAE, .PLY)
 # ==============================================================================
 
 
@@ -1129,7 +1390,7 @@ class MultiFormatMeshExporter:
     """
     Mengekspor mesh 3D terkalibrasi ke 4 format standar industri sekaligus:
       1. .STL (Binary solid manifold)
-      2. .OBJ + .MTL (dengan normal, UV terproyeksi, dan definisi material)
+      2. .OBJ + .MTL (Multi-material per warna layer CAD, lengkap dengan normal & UV)
       3. .DAE (COLLADA 1.4.1 dengan orientasi Z_UP dan unit skala untuk SketchUp)
       4. .PLY (Binary dengan vertex color RGBA)
     """
@@ -1151,7 +1412,7 @@ class MultiFormatMeshExporter:
         exported["STL"] = stl_path
 
         obj_path = self.cfg.output_dir / f"{base_name}.obj"
-        self._export_obj_with_mtl(mesh, obj_path, base_name)
+        self._export_obj_with_multimaterial_mtl(mesh, obj_path, base_name)
         exported["OBJ"] = obj_path
         exported["MTL"] = self.cfg.output_dir / f"{base_name}.mtl"
 
@@ -1171,58 +1432,82 @@ class MultiFormatMeshExporter:
 
         return exported
 
-    def _export_obj_with_mtl(self, mesh: trimesh.Trimesh, obj_path: Path, base_name: str) -> None:
+    def _export_obj_with_multimaterial_mtl(
+        self, mesh: trimesh.Trimesh, obj_path: Path, base_name: str
+    ) -> None:
         mtl_filename = f"{base_name}.mtl"
         mtl_path = obj_path.with_suffix(".mtl")
-
-        kd = (0.78, 0.80, 0.84)
-        if (
-            hasattr(mesh.visual, "vertex_colors")
-            and mesh.visual.vertex_colors is not None
-            and len(mesh.visual.vertex_colors) > 0
-        ):
-            mean_rgb = np.mean(mesh.visual.vertex_colors[:, :3], axis=0) / 255.0
-            kd = (float(mean_rgb[0]), float(mean_rgb[1]), float(mean_rgb[2]))
-
-        mtl_content = (
-            f"# Material file generated by Img2Mesh3D Pipeline\n"
-            f"newmtl material_calibrated\n"
-            f"Ka 0.150000 0.150000 0.150000\n"
-            f"Kd {kd[0]:.6f} {kd[1]:.6f} {kd[2]:.6f}\n"
-            f"Ks 0.250000 0.250000 0.250000\n"
-            f"Ns 64.000000\n"
-            f"d 1.000000\n"
-            f"illum 2\n"
-        )
-        mtl_path.write_text(mtl_content, encoding="utf-8")
 
         verts = mesh.vertices
         normals = mesh.vertex_normals
         faces = mesh.faces
 
+        has_vcolors = (
+            hasattr(mesh.visual, "vertex_colors")
+            and mesh.visual.vertex_colors is not None
+            and len(mesh.visual.vertex_colors) == len(verts)
+        )
+
+        if has_vcolors:
+            v_rgb = np.asarray(mesh.visual.vertex_colors[:, :3], dtype=np.uint8)
+            face_rgb = v_rgb[faces[:, 0]]
+        else:
+            face_rgb = np.tile(np.array([[199, 204, 214]], dtype=np.uint8), (len(faces), 1))
+
+        quant_rgb = (face_rgb // 4) * 4
+        unique_colors, inverse_idx = np.unique(quant_rgb, axis=0, return_inverse=True)
+
+        mtl_lines: List[str] = ["# Multi-Material MTL generated by Img2Mesh3D Pipeline"]
+        mat_names: List[str] = []
+
+        for idx, _ in enumerate(unique_colors):
+            group_mask = inverse_idx == idx
+            mean_col = np.mean(face_rgb[group_mask], axis=0)
+            r_int, g_int, b_int = int(round(mean_col[0])), int(round(mean_col[1])), int(round(mean_col[2]))
+            mat_name = f"cad_layer_{r_int:02X}{g_int:02X}{b_int:02X}_{idx + 1}"
+            mat_names.append(mat_name)
+
+            kd_r, kd_g, kd_b = mean_col[0] / 255.0, mean_col[1] / 255.0, mean_col[2] / 255.0
+            mtl_lines.extend(
+                [
+                    f"newmtl {mat_name}",
+                    "Ka 0.150000 0.150000 0.150000",
+                    f"Kd {kd_r:.6f} {kd_g:.6f} {kd_b:.6f}",
+                    "Ks 0.250000 0.250000 0.250000",
+                    "Ns 64.000000",
+                    "d 1.000000",
+                    "illum 2",
+                    "",
+                ]
+            )
+        mtl_path.write_text("\n".join(mtl_lines), encoding="utf-8")
+
         min_xy = verts[:, :2].min(axis=0)
         span_xy = np.maximum(verts[:, :2].max(axis=0) - min_xy, 1e-8)
         uvs = (verts[:, :2] - min_xy) / span_xy
 
-        lines: List[str] = [
+        obj_lines: List[str] = [
             f"# Wavefront OBJ exported by Img2Mesh3D ({self.cfg.calibration.unit})",
             f"mtllib {mtl_filename}",
             f"o {base_name}",
         ]
         for v in verts:
-            lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+            obj_lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
         for uv in uvs:
-            lines.append(f"vt {uv[0]:.6f} {uv[1]:.6f}")
+            obj_lines.append(f"vt {uv[0]:.6f} {uv[1]:.6f}")
         for vn in normals:
-            lines.append(f"vn {vn[0]:.6f} {vn[1]:.6f} {vn[2]:.6f}")
+            obj_lines.append(f"vn {vn[0]:.6f} {vn[1]:.6f} {vn[2]:.6f}")
 
-        lines.append("usemtl material_calibrated")
-        lines.append("s 1")
-        for f in faces:
-            i0, i1, i2 = int(f[0]) + 1, int(f[1]) + 1, int(f[2]) + 1
-            lines.append(f"f {i0}/{i0}/{i0} {i1}/{i1}/{i1} {i2}/{i2}/{i2}")
+        obj_lines.append("s 1")
+        for idx, mat_name in enumerate(mat_names):
+            obj_lines.append(f"g {mat_name}")
+            obj_lines.append(f"usemtl {mat_name}")
+            group_faces = faces[inverse_idx == idx]
+            for f in group_faces:
+                i0, i1, i2 = int(f[0]) + 1, int(f[1]) + 1, int(f[2]) + 1
+                obj_lines.append(f"f {i0}/{i0}/{i0} {i1}/{i1}/{i1} {i2}/{i2}/{i2}")
 
-        obj_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        obj_path.write_text("\n".join(obj_lines) + "\n", encoding="utf-8")
 
     def _export_sketchup_collada(self, mesh: trimesh.Trimesh, dae_path: Path) -> None:
         dae_bytes = trimesh.exchange.dae.export_collada(mesh)
@@ -1260,10 +1545,7 @@ class MultiFormatMeshExporter:
 
 
 class InteractiveMeshPreviewer:
-    """
-    Menyediakan inspeksi visual 3D interaktif menggunakan Open3D Visualizer
-    dengan overlay sumbu koordinat metrik, bounding box, dan grid bidang dasar Z=0.
-    """
+    """Inspeksi visual 3D interaktif menggunakan Open3D Visualizer."""
 
     @staticmethod
     def _has_display_server() -> bool:
@@ -1275,12 +1557,10 @@ class InteractiveMeshPreviewer:
     def _build_ground_grid(
         min_bound: np.ndarray, max_bound: np.ndarray
     ) -> o3d.geometry.LineSet:
-        """Membangun LineSet grid referensi pada bidang Z = 0."""
         span_x = max(float(max_bound[0] - min_bound[0]), 1.0)
         span_y = max(float(max_bound[1] - min_bound[1]), 1.0)
         max_span = max(span_x, span_y)
 
-        # Pilih interval grid kelipatan 1, 2, atau 5 berbasis pangkat 10
         raw_step = max_span / 10.0
         magnitude = 10.0 ** math.floor(math.log10(max(raw_step, 1e-6)))
         residual = raw_step / magnitude
@@ -1331,10 +1611,6 @@ class InteractiveMeshPreviewer:
         preview_cfg: PreviewConfig,
         output_dir: Path,
     ) -> bool:
-        """
-        Membuka jendela pratinjau Open3D interaktif.
-        Mengembalikan True apabila ekspor disetujui/dilanjutkan, atau False jika dibatalkan.
-        """
         if not cls._has_display_server():
             logger.warning(
                 "Lingkungan headless terdeteksi (tidak ada DISPLAY/WAYLAND_DISPLAY). "
@@ -1355,7 +1631,6 @@ class InteractiveMeshPreviewer:
         print("    [W] Toggle Wireframe | [B] Toggle Back-Face | [G] Toggle Grid & Sumbu XYZ")
         print("    [R] Reset Kamera     | [S] Simpan Screenshot PNG | [Q / ESC] Tutup Pratinjau\n")
 
-        # Siapkan geometri diagnostik
         max_dim = max(report.length_x, report.width_y, report.height_z, 1.0)
         axis_size = max_dim * 0.18
         coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
@@ -1399,7 +1674,6 @@ class InteractiveMeshPreviewer:
             render_opt.mesh_show_back_face = state["back_face"]
             render_opt.light_on = True
 
-            # Atur sudut pandang isometrik awal menghadap +Z dari kuadran depan-kanan
             ctr = vis.get_view_control()
             ctr.set_front([0.55, -0.65, 0.52])
             ctr.set_up([0.0, 0.0, 1.0])
@@ -1409,13 +1683,11 @@ class InteractiveMeshPreviewer:
             def toggle_wireframe(v: o3d.visualization.Visualizer) -> bool:
                 state["wireframe"] = not state["wireframe"]
                 v.get_render_option().mesh_show_wireframe = state["wireframe"]
-                logger.info("Preview Wireframe: %s", "ON" if state["wireframe"] else "OFF")
                 return False
 
             def toggle_backface(v: o3d.visualization.Visualizer) -> bool:
                 state["back_face"] = not state["back_face"]
                 v.get_render_option().mesh_show_back_face = state["back_face"]
-                logger.info("Preview Back-Face: %s", "ON" if state["back_face"] else "OFF")
                 return False
 
             def toggle_guides(v: o3d.visualization.Visualizer) -> bool:
@@ -1428,7 +1700,6 @@ class InteractiveMeshPreviewer:
                     v.remove_geometry(coord_frame, reset_bounding_box=False)
                     v.remove_geometry(aabb, reset_bounding_box=False)
                     v.remove_geometry(ground_grid, reset_bounding_box=False)
-                logger.info("Preview Diagnostic Guides: %s", "ON" if state["guides"] else "OFF")
                 return False
 
             def save_screenshot(v: o3d.visualization.Visualizer) -> bool:
@@ -1444,563 +1715,4 @@ class InteractiveMeshPreviewer:
                 return False
 
             vis.register_key_callback(ord("W"), toggle_wireframe)
-            vis.register_key_callback(ord("B"), toggle_backface)
-            vis.register_key_callback(ord("G"), toggle_guides)
-            vis.register_key_callback(ord("S"), save_screenshot)
-            vis.register_key_callback(ord("R"), reset_camera)
-
-            vis.run()
-            vis.destroy_window()
-
-        except Exception as exc:
-            logger.warning("Terjadi kendala pada jendela Open3D Visualizer: %s", exc)
-            return True
-
-        if preview_cfg.confirm_before_export:
-            try:
-                ans = input(
-                    f"Lanjutkan ekspor file 3D untuk '{report.model_name}' ke disk? [Y/n]: "
-                ).strip().lower()
-                if ans in ("n", "no", "tidak"):
-                    logger.warning("Ekspor file untuk '%s' dibatalkan oleh pengguna.", report.model_name)
-                    return False
-            except EOFError:
-                return True
-
-        return True
-
-
-class MeshValidator:
-    """Mengaudit dimensi fisik nyata, volume, dan integritas topologi mesh."""
-
-    @staticmethod
-    def validate(
-        model_name: str,
-        mesh: trimesh.Trimesh,
-        o3d_mesh: o3d.geometry.TriangleMesh,
-        unit: str,
-        exported_files: Optional[Dict[str, Path]] = None,
-    ) -> ValidationReport:
-        extents = mesh.extents
-        is_wt = bool(mesh.is_watertight)
-        volume = float(mesh.volume) if is_wt else None
-
-        return ValidationReport(
-            model_name=model_name,
-            unit=unit,
-            length_x=float(extents[0]),
-            width_y=float(extents[1]),
-            height_z=float(extents[2]),
-            num_vertices=int(len(mesh.vertices)),
-            num_faces=int(len(mesh.faces)),
-            surface_area=float(mesh.area),
-            volume=volume,
-            is_watertight=is_wt,
-            is_edge_manifold=bool(o3d_mesh.is_edge_manifold(allow_boundary_edges=False)),
-            is_vertex_manifold=bool(o3d_mesh.is_vertex_manifold()),
-            is_winding_consistent=bool(mesh.is_winding_consistent),
-            exported_files=exported_files or {},
-        )
-
-    @staticmethod
-    def print_report(report: ValidationReport) -> None:
-        u = report.unit
-        vol_str = f"{report.volume:,.4f} {u}^3" if report.volume is not None else "N/A (Open Surface)"
-        border = "=" * 72
-        print(f"\n{border}")
-        print(f" LAPORAN VALIDASI GEOMETRI & TOPOLOGI 3D : {report.model_name}")
-        print(border)
-        print(f"  Dimensi Fisik (P x L x T) : {report.length_x:.4f} x {report.width_y:.4f} x {report.height_z:.4f} {u}")
-        print(f"  Jumlah Vertices           : {report.num_vertices:,}")
-        print(f"  Jumlah Faces (Triangles)  : {report.num_faces:,}")
-        print(f"  Luas Permukaan Total      : {report.surface_area:,.4f} {u}^2")
-        print(f"  Volume Solid              : {vol_str}")
-        print(f"  Status Watertight (Solid) : {'YA (VALID)' if report.is_watertight else 'TIDAK (OPEN MESH)'}")
-        print(f"  Edge Manifold             : {'YA' if report.is_edge_manifold else 'TIDAK'}")
-        print(f"  Vertex Manifold           : {'YA' if report.is_vertex_manifold else 'TIDAK'}")
-        print(f"  Normal Winding Consistent : {'YA' if report.is_winding_consistent else 'TIDAK'}")
-        if report.exported_files:
-            print("-" * 72)
-            print("  File Output Terealisasi:")
-            for fmt, path in report.exported_files.items():
-                print(f"    [{fmt:<3}] -> {path.resolve()}")
-        print(f"{border}\n")
-
-
-# ==============================================================================
-# ORKESTRATOR UTAMA PIPELINE (SINGLE & MULTI-FILE)
-# ==============================================================================
-
-
-class ImageTo3DPipeline:
-    """Orkestrator end-to-end yang menghubungkan seluruh tahapan presisi."""
-
-    def __init__(self, config: PipelineConfig) -> None:
-        self.cfg = config
-        self.preprocessor = ImagePreprocessor(config)
-        self.cad_reconstructor = CadOrthographicReconstructor(config)
-        self.surface_reconstructor = SurfaceReliefReconstructor(config)
-        self.optimizer = MeshTopologyOptimizer(config)
-        self.exporter = MultiFormatMeshExporter(config)
-
-    def run(self) -> List[ValidationReport]:
-        reports: List[ValidationReport] = []
-        files = self.cfg.input_paths
-
-        if self.cfg.multi_strategy == "batch" or len(files) == 1:
-            for img_path in files:
-                logger.info("Memproses file tunggal: %s (Mode: %s)", img_path.name, self.cfg.mode.upper())
-                raw_mesh = self._process_single_file(img_path, z_offset=0.0)
-                report = self._finalize_and_export(raw_mesh, img_path.stem)
-                reports.append(report)
-
-        elif self.cfg.multi_strategy == "stack" and self.cfg.mode == "cad":
-            logger.info("Memproses %d file dalam mode STACKED CAD LAYERS...", len(files))
-            stacked_meshes: List[trimesh.Trimesh] = []
-            current_z = 0.0
-            step_z = self.cfg.calibration.extrude_height + self.cfg.layer_gap
-
-            for idx, img_path in enumerate(files):
-                logger.info("  Layer %d/%d: %s (Z=%.3f)", idx + 1, len(files), img_path.name, current_z)
-                layer_mesh = self._process_single_file(img_path, z_offset=current_z)
-                stacked_meshes.append(layer_mesh)
-                current_z += step_z
-
-            merged_stack = trimesh.util.concatenate(stacked_meshes)
-            report = self._finalize_and_export(merged_stack, "stacked_cad_assembly")
-            reports.append(report)
-
-        elif self.cfg.multi_strategy == "merge" and self.cfg.mode == "surface":
-            logger.info("Memproses %d file dalam mode MULTI-VIEW POINT CLOUD MERGE...", len(files))
-            combined_pcd = o3d.geometry.PointCloud()
-            voxel_size = self.cfg.calibration.scale_per_pixel * 1.5
-
-            for idx, img_path in enumerate(files):
-                img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
-                denoised = self.preprocessor.enhance_and_denoise(img_bgr)
-                pcd, _, _ = self.surface_reconstructor.build_calibrated_point_cloud(img_rgb, denoised)
-
-                if idx > 0 and len(combined_pcd.points) > 0:
-                    reg = o3d.pipelines.registration.registration_icp(
-                        pcd,
-                        combined_pcd,
-                        max_correspondence_distance=voxel_size * 5.0,
-                        init=np.eye(4),
-                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                    )
-                    pcd.transform(reg.transformation)
-                combined_pcd += pcd
-
-            combined_pcd = combined_pcd.voxel_down_sample(voxel_size=voxel_size)
-            raw_mesh = self.surface_reconstructor.reconstruct_from_point_cloud(combined_pcd)
-            report = self._finalize_and_export(raw_mesh, "merged_surface_model")
-            reports.append(report)
-        else:
-            raise PipelineError(
-                f"Kombinasi mode='{self.cfg.mode}' dan multi_strategy='{self.cfg.multi_strategy}' tidak didukung."
-            )
-
-        return reports
-
-    def _process_single_file(self, img_path: Path, z_offset: float) -> trimesh.Trimesh:
-        img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
-        denoised = self.preprocessor.enhance_and_denoise(img_bgr)
-
-        if self.cfg.mode == "cad":
-            binary = self.preprocessor.binarize_high_precision(denoised)
-            return self.cad_reconstructor.reconstruct(
-                binary_mask=binary,
-                denoised_gray=denoised,
-                img_rgb=img_rgb,
-                z_offset=z_offset,
-            )
-        else:
-            pcd, z_grid, rgb_grid = self.surface_reconstructor.build_calibrated_point_cloud(
-                img_rgb=img_rgb,
-                denoised_gray=denoised,
-            )
-            eff_scale = self.cfg.calibration.scale_per_pixel * (
-                img_rgb.shape[1] / float(z_grid.shape[1])
-            )
-            mesh = self.surface_reconstructor.reconstruct_from_point_cloud(
-                pcd=pcd,
-                z_grid=z_grid,
-                rgb_grid=rgb_grid,
-                eff_scale=eff_scale,
-            )
-            if z_offset != 0.0:
-                mesh.apply_translation([0.0, 0.0, z_offset])
-            return mesh
-
-    def _finalize_and_export(self, raw_mesh: trimesh.Trimesh, base_name: str) -> ValidationReport:
-        clean_tm, clean_o3d = self.optimizer.clean_and_optimize(raw_mesh)
-
-        # Audit geometri & topologi sebelum/sesudah ekspor
-        report = MeshValidator.validate(
-            model_name=base_name,
-            mesh=clean_tm,
-            o3d_mesh=clean_o3d,
-            unit=self.cfg.calibration.unit,
-        )
-
-        # Jika mode gerbang konfirmasi aktif, tampilkan pratinjau Open3D sebelum menulis file
-        if self.cfg.preview.enabled and self.cfg.preview.confirm_before_export:
-            MeshValidator.print_report(report)
-            approved = InteractiveMeshPreviewer.show(
-                o3d_mesh=clean_o3d,
-                report=report,
-                preview_cfg=self.cfg.preview,
-                output_dir=self.cfg.output_dir,
-            )
-            if not approved:
-                return report
-
-        exported_files = self.exporter.export_all(clean_tm, clean_o3d, base_name)
-        report.exported_files = exported_files
-        MeshValidator.print_report(report)
-
-        # Pratinjau interaktif standar setelah validasi & ekspor selesai
-        if self.cfg.preview.enabled and not self.cfg.preview.confirm_before_export:
-            InteractiveMeshPreviewer.show(
-                o3d_mesh=clean_o3d,
-                report=report,
-                preview_cfg=self.cfg.preview,
-                output_dir=self.cfg.output_dir,
-            )
-
-        return report
-
-
-# ==============================================================================
-# PARSING & ANTARMUKA CLI (COMMAND-LINE INTERFACE)
-# ==============================================================================
-
-
-def resolve_input_files(raw_inputs: Sequence[str]) -> List[Path]:
-    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-    resolved: List[Path] = []
-
-    for item in raw_inputs:
-        p = Path(item)
-        if p.is_dir():
-            for child in sorted(p.iterdir()):
-                if child.suffix.lower() in valid_exts:
-                    resolved.append(child)
-        elif "*" in item or "?" in item:
-            for match in sorted(glob.glob(item)):
-                mp = Path(match)
-                if mp.is_file() and mp.suffix.lower() in valid_exts:
-                    resolved.append(mp)
-        elif p.is_file():
-            resolved.append(p)
-        else:
-            raise FileNotFoundError(f"Input tidak ditemukan: {item}")
-
-    if not resolved:
-        raise FileNotFoundError("Tidak ada file gambar valid (JPG/PNG) yang ditemukan.")
-    return resolved
-
-
-def parse_points_string(pts_str: str) -> np.ndarray:
-    pairs = [seg.strip() for seg in pts_str.split(";") if seg.strip()]
-    if len(pairs) != 4:
-        raise CalibrationError(
-            f"--homography-points harus berisi tepat 4 titik dipisah ';' (ditemukan: {len(pairs)})."
-        )
-    coords: List[Tuple[float, float]] = []
-    for pair in pairs:
-        xy = pair.split(",")
-        if len(xy) != 2:
-            raise CalibrationError(f"Format koordinat tidak valid: '{pair}'. Gunakan format 'x,y'.")
-        coords.append((float(xy[0]), float(xy[1])))
-    return np.array(coords, dtype=np.float32)
-
-
-def parse_wx_h(size_str: str, sep: str = "x") -> Tuple[float, float]:
-    parts = size_str.lower().split(sep)
-    if len(parts) != 2:
-        raise CalibrationError(f"Format ukuran tidak valid: '{size_str}'. Gunakan format 'WxH'.")
-    return float(parts[0]), float(parts[1])
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Konversi Presisi Tinggi Gambar 2D ke Model 3D dengan Kalibrasi Intrinsik, Homografi, & Open3D Preview",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # --- Sub-Mode Utilitas: Kalibrasi Kamera Papan Catur ---
-    calib_group = parser.add_argument_group("Kalibrasi Matriks Intrinsik Kamera (Tahap 0A)")
-    calib_group.add_argument(
-        "--calibrate-chessboard",
-        nargs="+",
-        help="Folder/daftar foto papan catur untuk menghitung matriks intrinsik kamera K & distorsi",
-    )
-    calib_group.add_argument(
-        "--chessboard-size",
-        type=str,
-        default="9x6",
-        help="Jumlah sudut dalam papan catur (KolomxBaris, mis. 9x6)",
-    )
-    calib_group.add_argument(
-        "--square-size",
-        type=float,
-        default=25.0,
-        help="Ukuran sisi satu kotak papan catur dalam satuan nyata (mis. 25.0 mm)",
-    )
-    calib_group.add_argument(
-        "--save-calib",
-        type=Path,
-        default=Path("./camera_intrinsics.json"),
-        help="Path file JSON keluaran hasil kalibrasi kamera",
-    )
-    calib_group.add_argument(
-        "--camera-calib",
-        type=Path,
-        default=None,
-        help="Path file JSON kalibrasi intrinsik kamera untuk menghilangkan distorsi lensa",
-    )
-    calib_group.add_argument(
-        "--intrinsics-manual",
-        type=str,
-        default=None,
-        help="Parameter intrinsik manual 'fx,fy,cx,cy,k1,k2,p1,p2[,k3]' jika tidak memakai JSON",
-    )
-
-    # --- Sub-Mode Koreksi Perspektif Homografi 4-Titik ---
-    homo_group = parser.add_argument_group("Koreksi Perspektif Homografi 4-Titik (Tahap 0B)")
-    homo_group.add_argument(
-        "--homography-points",
-        type=str,
-        default=None,
-        help="4 titik sudut referensi piksel 'x1,y1;x2,y2;x3,y3;x4,y4' berurutan [TL, TR, BR, BL]",
-    )
-    homo_group.add_argument(
-        "--pick-points",
-        action="store_true",
-        help="Pilih 4 titik sudut referensi secara interaktif dengan klik mouse pada gambar",
-    )
-    homo_group.add_argument(
-        "--homography-size",
-        type=str,
-        default=None,
-        help="Dimensi fisik nyata bidang 4 titik 'LebarxTinggi' dalam satuan --unit (mis. 210x297 untuk A4 mm)",
-    )
-    homo_group.add_argument(
-        "--homography-crop",
-        action="store_true",
-        help="Potong output hanya di dalam area 4 titik (default: pertahankan seluruh kanvas)",
-    )
-
-    # --- Sub-Mode Pratinjau 3D Interaktif (Tahap 5) ---
-    prev_group = parser.add_argument_group("Pratinjau Mesh 3D Interaktif Open3D (Tahap 5)")
-    prev_group.add_argument(
-        "--preview",
-        action="store_true",
-        help="Buka jendela Open3D Visualizer interaktif pada tahap validasi akhir",
-    )
-    prev_group.add_argument(
-        "--preview-wireframe",
-        action="store_true",
-        help="Aktifkan tampilan wireframe segitiga secara default saat pratinjau dibuka",
-    )
-    prev_group.add_argument(
-        "--confirm-export",
-        action="store_true",
-        help="Tampilkan pratinjau terlebih dahulu dan minta konfirmasi terminal [Y/n] sebelum menyimpan file",
-    )
-
-    # --- Input & Rekonstruksi Utama ---
-    parser.add_argument(
-        "-i", "--input",
-        nargs="+",
-        help="Path 1 file gambar, beberapa file gambar, folder, atau wildcard (mis. *.png)",
-    )
-    parser.add_argument(
-        "-o", "--output-dir",
-        type=Path,
-        default=Path("./output_3d"),
-        help="Direktori penyimpanan hasil ekspor 3D",
-    )
-    parser.add_argument(
-        "-m", "--mode",
-        choices=["cad", "surface"],
-        default="cad",
-        help="Mode rekonstruksi: 'cad' (Mode A: kontur & ekstrusi) atau 'surface' (Mode B: depth/relief)",
-    )
-    parser.add_argument(
-        "--multi-strategy",
-        choices=["batch", "stack", "merge"],
-        default="batch",
-        help="Strategi multi-file: 'batch' (terpisah), 'stack' (tumpuk layer Z di Mode A), 'merge' (ICP Mode B)",
-    )
-    parser.add_argument(
-        "--ref-real-size",
-        type=float,
-        default=None,
-        help="Ukuran fisik referensi nyata (wajib jika tidak menggunakan --homography-size)",
-    )
-    parser.add_argument(
-        "--ref-pixels",
-        type=float,
-        default=None,
-        help="Panjang objek referensi dalam piksel (wajib jika tidak menggunakan --homography-size)",
-    )
-    parser.add_argument(
-        "--unit",
-        choices=["mm", "cm", "m"],
-        default="mm",
-        help="Satuan fisik model 3D",
-    )
-    parser.add_argument(
-        "--extrude-height",
-        type=float,
-        default=5.0,
-        help="Tinggi ekstrusi Z (Mode A) atau amplitudo relief maksimum (Mode B) dalam satuan --unit",
-    )
-    parser.add_argument(
-        "--invert",
-        action="store_true",
-        help="Balik polaritas objek (objek terang di atas latar gelap)",
-    )
-    parser.add_argument("--rdp-epsilon", type=float, default=0.35, help="Toleransi Ramer-Douglas-Peucker (px)")
-    parser.add_argument("--min-area", type=float, default=25.0, help="Luas kontur minimum (px^2)")
-    parser.add_argument("--layer-gap", type=float, default=0.0, help="Celah antar layer pada mode stack")
-    parser.add_argument(
-        "--depth-backend",
-        choices=["heightmap", "depth-anything", "midas"],
-        default="heightmap",
-        help="Backend estimasi kedalaman untuk Mode B",
-    )
-    parser.add_argument(
-        "--surface-method",
-        choices=["poisson", "alpha", "grid-solid"],
-        default="poisson",
-        help="Algoritma rekonstruksi permukaan untuk Mode B",
-    )
-    parser.add_argument("--poisson-depth", type=int, default=9, help="Kedalaman octree Poisson (8-11)")
-    parser.add_argument("--no-solid-base", action="store_true", help="Jangan tutup alas bawah Z=0 pada Mode B")
-    parser.add_argument("--taubin-iter", type=int, default=5, help="Iterasi Taubin smoothing pada Mode B")
-    parser.add_argument("--decimate", type=float, default=0.0, help="Rasio reduksi segitiga (0.0 - 0.90)")
-
-    args = parser.parse_args()
-
-    try:
-        if args.calibrate_chessboard:
-            calib_imgs = resolve_input_files(args.calibrate_chessboard)
-            cols_f, rows_f = parse_wx_h(args.chessboard_size)
-            CameraIntrinsicsCalibrator.calibrate_from_chessboard(
-                image_paths=calib_imgs,
-                board_size=(int(cols_f), int(rows_f)),
-                square_size=args.square_size,
-                save_path=args.save_calib,
-            )
-            if not args.input:
-                return 0
-
-        if not args.input:
-            raise CalibrationError("Argumen --input wajib diisi untuk menjalankan rekonstruksi 3D.")
-
-        input_files = resolve_input_files(args.input)
-
-        intrinsics_cfg: Optional[CameraIntrinsicsConfig] = None
-        if args.camera_calib is not None:
-            intrinsics_cfg = CameraIntrinsicsConfig.from_json(args.camera_calib)
-        elif args.intrinsics_manual is not None:
-            vals = [float(v.strip()) for v in args.intrinsics_manual.split(",") if v.strip()]
-            if len(vals) < 8:
-                raise CalibrationError(
-                    "--intrinsics-manual membutuhkan minimal 8 nilai: fx,fy,cx,cy,k1,k2,p1,p2[,k3]."
-                )
-            intrinsics_cfg = CameraIntrinsicsConfig.from_manual_params(
-                fx=vals[0], fy=vals[1], cx=vals[2], cy=vals[3], dist_coeffs=vals[4:]
-            )
-
-        homography_cfg: Optional[HomographyConfig] = None
-        if args.homography_points is not None or args.pick_points:
-            if args.homography_size is None:
-                raise CalibrationError(
-                    "--homography-size (mis. 210x297) wajib diisi saat menggunakan homografi 4-titik."
-                )
-            h_w, h_h = parse_wx_h(args.homography_size)
-            pts = (
-                parse_points_string(args.homography_points)
-                if args.homography_points is not None
-                else np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
-            )
-            homography_cfg = HomographyConfig(
-                src_points=pts,
-                rect_real_width=h_w,
-                rect_real_height=h_h,
-                keep_full_canvas=not args.homography_crop,
-            )
-
-        if homography_cfg is not None:
-            calib_cfg = CalibrationConfig(
-                ref_real_size=1.0,
-                ref_pixels=1.0,
-                unit=args.unit,
-                extrude_height=args.extrude_height,
-                invert_polarity=args.invert,
-            )
-        else:
-            if args.ref_real_size is None or args.ref_pixels is None:
-                raise CalibrationError(
-                    "Isi --ref-real-size dan --ref-pixels, ATAU aktifkan homografi 4-titik "
-                    "(--homography-points / --pick-points + --homography-size)."
-                )
-            calib_cfg = CalibrationConfig(
-                ref_real_size=args.ref_real_size,
-                ref_pixels=args.ref_pixels,
-                unit=args.unit,
-                extrude_height=args.extrude_height,
-                invert_polarity=args.invert,
-            )
-
-        preview_cfg = PreviewConfig(
-            enabled=args.preview or args.confirm_export,
-            wireframe=args.preview_wireframe,
-            confirm_before_export=args.confirm_export,
-        )
-
-        config = PipelineConfig(
-            input_paths=input_files,
-            output_dir=args.output_dir,
-            mode=args.mode,
-            multi_strategy=args.multi_strategy,
-            calibration=calib_cfg,
-            camera_intrinsics=intrinsics_cfg,
-            homography=homography_cfg,
-            interactive_pick_points=args.pick_points,
-            rdp_epsilon_px=args.rdp_epsilon,
-            min_contour_area_px=args.min_area,
-            layer_gap=args.layer_gap,
-            depth_backend=args.depth_backend,
-            surface_method=args.surface_method,
-            poisson_depth=args.poisson_depth,
-            close_solid_base=not args.no_solid_base,
-            taubin_iterations=args.taubin_iter,
-            target_reduction=args.decimate,
-            preview=preview_cfg,
-        )
-
-        pipeline = ImageTo3DPipeline(config)
-        pipeline.run()
-        return 0
-
-    except PipelineError as exc:
-        logger.error("Kesalahan Pipeline Geometri: %s", exc)
-        return 1
-    except FileNotFoundError as exc:
-        logger.error("Kesalahan Berkas Input: %s", exc)
-        return 2
-    except KeyboardInterrupt:
-        logger.warning("Proses dibatalkan oleh pengguna.")
-        return 130
-    except Exception as exc:
-        logger.exception("Kesalahan tak terduga: %s", exc)
-        return 99
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+            vis.register_key_callback(ord("B"),
