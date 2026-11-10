@@ -15,7 +15,7 @@ mapbox_earcut
 
 # === Optional: Deep Learning Monocular Depth (Mode B) ===
 # Hapus tanda komentar (#) jika menggunakan backend 'depth-anything' atau 'midas'
-# torch>=2.2.0
-# torchvision>=0.17.0
-# transformers>=4.40.0
-# timm>=0.9.16
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.40.0
+timm>=0.9.16
