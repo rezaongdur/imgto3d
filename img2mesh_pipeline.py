@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 End-to-End 2D Image(s) to Calibrated 3D Solid Mesh Reconstruction Pipeline
-(Dengan Multi-Color CAD Layer Extrusion, Kalibrasi Intrinsik, Homografi 4-Titik,
-Open3D Interactive Preview, dan Dokumentasi CLI --help Terstruktur).
+(Dengan Deteksi Otomatis Marker ArUco cv2.aruco, Multi-Color CAD Layer Extrusion,
+Kalibrasi Intrinsik Kamera, Homografi 4-Titik, Open3D Interactive Preview, dan --help).
 
 Tahapan Pipeline:
   - Tahap 0A: Kalibrasi & Undistorsi Matriks Intrinsik Kamera (Brown-Conrady / Zhang)
-  - Tahap 0B: Koreksi Perspektif Homografi 4-Titik (Metric Bird's-Eye Rectification)
-  - Tahap 1 : Preprocessing Adaptif (CLAHE + Bilateral Filter) & Kalibrasi Skala 1:1
+  - Tahap 0B: Deteksi Otomatis Marker ArUco (cv2.aruco) & Rektifikasi Homografi 4-Titik (1:1)
+  - Tahap 1 : Preprocessing Adaptif (CLAHE + Bilateral Filter) & Kalibrasi Skala Metrik
   - Tahap 2 : Rekonstruksi 3D Mode A (Single-Layer atau Multi-Color Multi-Height CAD)
               atau Mode B (Depth Anything V2 / MiDaS / Heightmap + Poisson / Alpha Shapes)
   - Tahap 3 : Mesh Cleaning & Topology Optimization (Watertight, Manifold, Taubin)
@@ -39,7 +39,7 @@ from scipy.ndimage import gaussian_filter
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 from shapely.validation import make_valid
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # ==============================================================================
 # KONFIGURASI LOGGING & CUSTOM EXCEPTIONS
@@ -58,7 +58,7 @@ class PipelineError(Exception):
 
 
 class CalibrationError(PipelineError):
-    """Dilempar apabila parameter kalibrasi kamera, homografi, atau skala tidak valid."""
+    """Dilempar apabila parameter kalibrasi kamera, ArUco, homografi, atau skala tidak valid."""
 
 
 class GeometryExtractionError(PipelineError):
@@ -124,6 +124,61 @@ ModeType = Literal["cad", "surface"]
 MultiFileStrategy = Literal["batch", "stack", "merge"]
 DepthBackend = Literal["heightmap", "depth-anything", "midas"]
 SurfaceMethod = Literal["poisson", "alpha", "grid-solid"]
+ArucoAnchorType = Literal["outer", "inner", "center"]
+
+SUPPORTED_ARUCO_DICTS: Tuple[str, ...] = (
+    "DICT_4X4_50",
+    "DICT_4X4_100",
+    "DICT_4X4_250",
+    "DICT_4X4_1000",
+    "DICT_5X5_50",
+    "DICT_5X5_100",
+    "DICT_5X5_250",
+    "DICT_5X5_1000",
+    "DICT_6X6_50",
+    "DICT_6X6_100",
+    "DICT_6X6_250",
+    "DICT_6X6_1000",
+    "DICT_7X7_50",
+    "DICT_7X7_100",
+    "DICT_7X7_250",
+    "DICT_7X7_1000",
+    "DICT_ARUCO_ORIGINAL",
+    "DICT_APRILTAG_16h5",
+    "DICT_APRILTAG_25h9",
+    "DICT_APRILTAG_36h10",
+    "DICT_APRILTAG_36h11",
+)
+
+
+@dataclass
+class ArucoConfig:
+    """Konfigurasi deteksi otomatis marker ArUco (cv2.aruco) untuk homografi & skala 1:1."""
+
+    dict_name: str = "DICT_4X4_50"
+    board_real_size: Optional[Tuple[float, float]] = None  # (width, height) untuk mode 4-sudut
+    marker_real_size: Optional[float] = None               # sisi S untuk mode marker tunggal
+    corner_ids: Tuple[int, int, int, int] = (0, 1, 2, 3)   # [TL, TR, BR, BL]
+    target_single_id: Optional[int] = None
+    anchor_mode: ArucoAnchorType = "outer"
+    keep_full_canvas: bool = True
+    save_debug_overlay: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dict_name not in SUPPORTED_ARUCO_DICTS:
+            raise CalibrationError(f"Kamus ArUco tidak didukung: '{self.dict_name}'.")
+        if self.board_real_size is not None:
+            w, h = self.board_real_size
+            if w <= 0.0 or h <= 0.0:
+                raise CalibrationError("--aruco-board-size harus memiliki lebar dan tinggi > 0.")
+        if self.marker_real_size is not None and self.marker_real_size <= 0.0:
+            raise CalibrationError("--aruco-marker-size harus lebih besar dari 0.")
+        if len(set(self.corner_ids)) != 4:
+            raise CalibrationError("--aruco-ids harus berisi 4 ID marker unik berurutan [TL,TR,BR,BL].")
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.board_real_size is not None or self.marker_real_size is not None
 
 
 @dataclass
@@ -298,8 +353,9 @@ class PipelineConfig:
     calibration: CalibrationConfig = field(
         default_factory=lambda: CalibrationConfig(100.0, 100.0, "mm", 5.0)
     )
-    # Tahap 0: Camera Intrinsics & Homography Perspective Rectification
+    # Tahap 0: Camera Intrinsics, ArUco Auto-Calibration, & Homography Perspective Rectification
     camera_intrinsics: Optional[CameraIntrinsicsConfig] = None
+    aruco: Optional[ArucoConfig] = None
     homography: Optional[HomographyConfig] = None
     interactive_pick_points: bool = False
     # Tahap 1: Preprocessing
@@ -460,7 +516,313 @@ class CameraIntrinsicsCalibrator:
 
 
 # ==============================================================================
-# TAHAP 0B: KOREKSI PERSPEKTIF HOMOGRAFI 4-TITIK (METRIC RECTIFICATION)
+# TAHAP 0B-1: DETEKSI OTOMATIS MARKER ARUCO (cv2.aruco) UNTUK HOMOGRAFI & SKALA
+# ==============================================================================
+
+
+class ArucoAutoCalibrator:
+    """
+    Mendeteksi penanda fiducial ArUco (cv2.aruco) secara sub-piksel untuk:
+      1. Ekstraksi otomatis 4 titik sudut referensi homografi [TL, TR, BR, BL], dan
+      2. Kalibrasi skala metrik 1:1 dunia nyata tanpa klik manual.
+    """
+
+    @staticmethod
+    def _get_dictionary(dict_name: str) -> object:
+        if not hasattr(cv2, "aruco"):
+            raise CalibrationError(
+                "Modul 'cv2.aruco' tidak tersedia. Pasang 'opencv-contrib-python' (pip install opencv-contrib-python)."
+            )
+        dict_id = getattr(cv2.aruco, dict_name, None)
+        if dict_id is None:
+            raise CalibrationError(f"Kamus ArUco tidak ditemukan di OpenCV: '{dict_name}'.")
+        if hasattr(cv2.aruco, "getPredefinedDictionary"):
+            return cv2.aruco.getPredefinedDictionary(dict_id)
+        return cv2.aruco.Dictionary_get(dict_id)
+
+    @staticmethod
+    def _create_detector_params() -> object:
+        if hasattr(cv2.aruco, "DetectorParameters"):
+            params = cv2.aruco.DetectorParameters()
+        else:
+            params = cv2.aruco.DetectorParameters_create()
+
+        if hasattr(cv2.aruco, "CORNER_REFINE_SUBPIX"):
+            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            params.cornerRefinementWinSize = 5
+            params.cornerRefinementMaxIterations = 40
+            params.cornerRefinementMinAccuracy = 0.01
+        return params
+
+    @classmethod
+    def detect_markers(
+        cls, img_bgr: np.ndarray, dict_name: str
+    ) -> Dict[int, np.ndarray]:
+        """
+        Mendeteksi semua marker ArUco dalam citra dan mengembalikan dictionary:
+          { marker_id: ndarray shape (4, 2) float32 [TL, TR, BR, BL] }.
+        """
+        aruco_dict = cls._get_dictionary(dict_name)
+        params = cls._create_detector_params()
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+            corners_list, ids, _ = detector.detectMarkers(gray)
+        else:
+            corners_list, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
+
+        # Coba sekali lagi dengan CLAHE kontras jika pencahayaan tidak merata
+        if ids is None or len(ids) == 0:
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            gray_eq = clahe.apply(gray)
+            if hasattr(cv2.aruco, "ArucoDetector"):
+                detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+                corners_list, ids, _ = detector.detectMarkers(gray_eq)
+            else:
+                corners_list, ids, _ = cv2.aruco.detectMarkers(gray_eq, aruco_dict, parameters=params)
+
+        if ids is None or len(ids) == 0:
+            return {}
+
+        detected_map: Dict[int, np.ndarray] = {}
+        for idx, raw_id in enumerate(ids.flatten()):
+            m_id = int(raw_id)
+            pts = np.asarray(corners_list[idx], dtype=np.float32).reshape(4, 2)
+            # Jika terdapat duplikat ID, pilih yang memiliki luas poligon lebih besar
+            if m_id not in detected_map or cv2.contourArea(pts) > cv2.contourArea(detected_map[m_id]):
+                detected_map[m_id] = pts
+
+        return detected_map
+
+    @classmethod
+    def build_homography_from_aruco(
+        cls,
+        img_bgr: np.ndarray,
+        aruco_cfg: ArucoConfig,
+        unit: str,
+        debug_output_path: Optional[Path] = None,
+    ) -> HomographyConfig:
+        """
+        Menghasilkan HomographyConfig secara otomatis dari marker ArUco terdeteksi.
+        """
+        detected = cls.detect_markers(img_bgr, aruco_cfg.dict_name)
+        found_ids = sorted(detected.keys())
+
+        if not detected:
+            raise CalibrationError(
+                f"Tidak ada marker ArUco ({aruco_cfg.dict_name}) yang terdeteksi pada citra! "
+                "Periksa kamus --aruco-dict, pencahayaan, atau pastikan marker terlihat penuh."
+            )
+
+        logger.info("ArUco Terdeteksi (%s) | IDs ditemukan: %s", aruco_cfg.dict_name, found_ids)
+
+        # Kasus 1: Mode 4-Sudut Reference Board (--aruco-board-size WxH)
+        if aruco_cfg.board_real_size is not None:
+            id_tl, id_tr, id_br, id_bl = aruco_cfg.corner_ids
+            required_ids = [id_tl, id_tr, id_br, id_bl]
+            missing = [mid for mid in required_ids if mid not in detected]
+            if missing:
+                raise CalibrationError(
+                    f"Marker ArUco sudut referensi tidak lengkap! ID dibutuhkan: {required_ids}, "
+                    f"ID hilang: {missing}, ID terdeteksi: {found_ids}."
+                )
+
+            c_tl = detected[id_tl]
+            c_tr = detected[id_tr]
+            c_br = detected[id_br]
+            c_bl = detected[id_bl]
+
+            if aruco_cfg.anchor_mode == "outer":
+                src_pts = np.array([c_tl[0], c_tr[1], c_br[2], c_bl[3]], dtype=np.float32)
+            elif aruco_cfg.anchor_mode == "inner":
+                src_pts = np.array([c_tl[2], c_tr[3], c_br[0], c_bl[1]], dtype=np.float32)
+            else:  # center
+                src_pts = np.array(
+                    [c_tl.mean(axis=0), c_tr.mean(axis=0), c_br.mean(axis=0), c_bl.mean(axis=0)],
+                    dtype=np.float32,
+                )
+
+            real_w, real_h = aruco_cfg.board_real_size
+            logger.info(
+                "Kalibrasi ArUco 4-Sudut Berhasil | IDs=%s | Anchor='%s' | Bidang Fisik=%.3fx%.3f %s",
+                required_ids,
+                aruco_cfg.anchor_mode,
+                real_w,
+                real_h,
+                unit,
+            )
+
+        # Kasus 2: Mode Marker Tunggal (--aruco-marker-size S)
+        elif aruco_cfg.marker_real_size is not None:
+            if aruco_cfg.target_single_id is not None:
+                if aruco_cfg.target_single_id not in detected:
+                    raise CalibrationError(
+                        f"Marker ArUco target ID={aruco_cfg.target_single_id} tidak ditemukan "
+                        f"(ID terdeteksi: {found_ids})."
+                    )
+                chosen_id = aruco_cfg.target_single_id
+            else:
+                # Pilih marker dengan luas piksel terbesar agar presisi sub-piksel maksimal
+                chosen_id = max(found_ids, key=lambda mid: float(cv2.contourArea(detected[mid])))
+
+            src_pts = detected[chosen_id].astype(np.float32)  # [TL, TR, BR, BL]
+            real_w = float(aruco_cfg.marker_real_size)
+            real_h = float(aruco_cfg.marker_real_size)
+            logger.info(
+                "Kalibrasi ArUco Marker Tunggal Berhasil | ID=%d | Ukuran Sisi=%.3f %s",
+                chosen_id,
+                real_w,
+                unit,
+            )
+        else:
+            raise CalibrationError(
+                "Isi --aruco-board-size atau --aruco-marker-size untuk mengaktifkan kalibrasi ArUco."
+            )
+
+        if debug_output_path is not None:
+            cls._save_debug_overlay(img_bgr, detected, src_pts, debug_output_path)
+
+        return HomographyConfig(
+            src_points=src_pts,
+            rect_real_width=real_w,
+            rect_real_height=real_h,
+            keep_full_canvas=aruco_cfg.keep_full_canvas,
+        )
+
+    @staticmethod
+    def _save_debug_overlay(
+        img_bgr: np.ndarray,
+        detected_map: Dict[int, np.ndarray],
+        homography_pts: np.ndarray,
+        save_path: Path,
+    ) -> None:
+        vis = img_bgr.copy()
+        for m_id, pts in detected_map.items():
+            pts_i = np.round(pts).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(vis, [pts_i], isClosed=True, color=(0, 220, 0), thickness=2)
+            cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+            cv2.putText(
+                vis,
+                f"ID:{m_id}",
+                (cx - 24, cy + 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+
+        h_pts_i = np.round(homography_pts).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(vis, [h_pts_i], isClosed=True, color=(0, 180, 255), thickness=3)
+        labels = ["TL", "TR", "BR", "BL"]
+        for idx, (px, py) in enumerate(homography_pts):
+            cv2.circle(vis, (int(px), int(py)), 7, (0, 0, 255), -1)
+            cv2.putText(
+                vis,
+                labels[idx],
+                (int(px) + 8, int(py) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 255),
+                2,
+            )
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(save_path), vis)
+        logger.info("Visualisasi deteksi ArUco disimpan ke: %s", save_path.resolve())
+
+    @classmethod
+    def generate_calibration_sheet(
+        cls,
+        output_path: Path,
+        dict_name: str = "DICT_4X4_50",
+        board_size_units: Tuple[float, float] = (210.0, 297.0),
+        marker_size_units: float = 30.0,
+        corner_ids: Tuple[int, int, int, int] = (0, 1, 2, 3),
+        unit: str = "mm",
+        ppu: float = 8.0,
+    ) -> None:
+        """
+        Membuat lembar kalibrasi PNG beresolusi tinggi dengan 4 marker ArUco di sudut
+        bidang referensi [TL, TR, BR, BL] (anchor='outer') siap cetak.
+        """
+        aruco_dict = cls._get_dictionary(dict_name)
+        board_w, board_h = board_size_units
+        if marker_size_units * 2.5 >= min(board_w, board_h):
+            raise CalibrationError(
+                "Ukuran marker terlalu besar dibandingkan ukuran papan referensi."
+            )
+
+        margin_units = max(10.0, marker_size_units * 0.4)
+        canvas_w = int(round((board_w + 2.0 * margin_units) * ppu))
+        canvas_h = int(round((board_h + 2.0 * margin_units) * ppu))
+        marker_px = max(32, int(round(marker_size_units * ppu)))
+        margin_px = int(round(margin_units * ppu))
+        board_w_px = int(round(board_w * ppu))
+        board_h_px = int(round(board_h * ppu))
+
+        canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+
+        # Gambar garis batas luar bidang referensi (anchor='outer')
+        x0, y0 = margin_px, margin_px
+        x1, y1 = margin_px + board_w_px, margin_px + board_h_px
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (200, 200, 200), 1)
+
+        positions = [
+            (corner_ids[0], x0, y0, "TL"),
+            (corner_ids[1], x1 - marker_px, y0, "TR"),
+            (corner_ids[2], x1 - marker_px, y1 - marker_px, "BR"),
+            (corner_ids[3], x0, y1 - marker_px, "BL"),
+        ]
+
+        for m_id, px, py, corner_lbl in positions:
+            if hasattr(cv2.aruco, "generateImageMarker"):
+                m_gray = cv2.aruco.generateImageMarker(aruco_dict, int(m_id), marker_px)
+            else:
+                m_gray = cv2.aruco.drawMarker(aruco_dict, int(m_id), marker_px)
+            m_bgr = cv2.cvtColor(m_gray, cv2.COLOR_GRAY2BGR)
+            canvas[py : py + marker_px, px : px + marker_px] = m_bgr
+
+            txt_y = py - 8 if corner_lbl in ("TL", "TR") else py + marker_px + 20
+            cv2.putText(
+                canvas,
+                f"{corner_lbl} (ID {m_id})",
+                (px, max(18, min(canvas_h - 8, txt_y))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (60, 60, 60),
+                1,
+            )
+
+        info_text = (
+            f"Img2Mesh3D ArUco Calibration Sheet | {dict_name} | "
+            f"Outer Board: {board_w}x{board_h} {unit} | IDs: {list(corner_ids)}"
+        )
+        cv2.putText(
+            canvas,
+            info_text,
+            (x0, canvas_h - max(10, margin_px // 3)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (80, 80, 80),
+            1,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output_path), canvas)
+        logger.info(
+            "Lembar kalibrasi ArUco 4-sudut dibuat di: %s (%dx%d px | Outer=%gx%g %s)",
+            output_path.resolve(),
+            canvas_w,
+            canvas_h,
+            board_w,
+            board_h,
+            unit,
+        )
+
+
+# ==============================================================================
+# TAHAP 0B-2: KOREKSI PERSPEKTIF HOMOGRAFI 4-TITIK (METRIC RECTIFICATION)
 # ==============================================================================
 
 
@@ -524,7 +886,7 @@ class HomographyPerspectiveRectifier:
                     break
         except cv2.error as exc:
             raise CalibrationError(
-                f"Gagal membuka GUI OpenCV untuk --pick-points (gunakan --homography-points pada server headless): {exc}"
+                f"Gagal membuka GUI OpenCV untuk --pick-points (gunakan --aruco-* atau --homography-points): {exc}"
             ) from exc
         finally:
             cv2.destroyAllWindows()
@@ -620,7 +982,7 @@ class HomographyPerspectiveRectifier:
 
 
 class ImagePreprocessor:
-    """Menangani pemuatan citra, koreksi lensa/perspektif, CLAHE, bilateral filter, dan binarisasi."""
+    """Menangani pemuatan citra, koreksi lensa/ArUco/perspektif, CLAHE, bilateral filter, dan binarisasi."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
@@ -642,17 +1004,33 @@ class ImagePreprocessor:
         elif img_bgr.ndim == 2:
             img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
 
+        # Tahap 0A: Undistorsi Lensa Kamera
         if self.cfg.camera_intrinsics is not None:
             logger.info("Menerapkan koreksi distorsi lensa dari matriks intrinsik kamera...")
             img_bgr = CameraIntrinsicsCalibrator.undistort_image(img_bgr, self.cfg.camera_intrinsics)
 
-        if self.cfg.homography is not None:
-            if self.cfg.interactive_pick_points:
+        # Tahap 0B: Deteksi Otomatis ArUco -> Homografi 4-Titik & Skala 1:1
+        active_homography: Optional[HomographyConfig] = self.cfg.homography
+        if self.cfg.aruco is not None and self.cfg.aruco.is_enabled:
+            debug_path = (
+                self.cfg.output_dir / f"{image_path.stem}_aruco_detected.png"
+                if self.cfg.aruco.save_debug_overlay
+                else None
+            )
+            active_homography = ArucoAutoCalibrator.build_homography_from_aruco(
+                img_bgr=img_bgr,
+                aruco_cfg=self.cfg.aruco,
+                unit=self.cfg.calibration.unit,
+                debug_output_path=debug_path,
+            )
+
+        if active_homography is not None:
+            if self.cfg.interactive_pick_points and (self.cfg.aruco is None or not self.cfg.aruco.is_enabled):
                 picked = HomographyPerspectiveRectifier.interactive_pick_4_points(img_bgr)
-                self.cfg.homography.src_points = picked
+                active_homography.src_points = picked
 
             img_bgr, new_scale_per_px, _ = HomographyPerspectiveRectifier.rectify(
-                img_bgr, self.cfg.homography
+                img_bgr, active_homography
             )
             self.cfg.calibration.ref_real_size = new_scale_per_px
             self.cfg.calibration.ref_pixels = 1.0
@@ -1715,4 +2093,935 @@ class InteractiveMeshPreviewer:
                 return False
 
             vis.register_key_callback(ord("W"), toggle_wireframe)
-            vis.register_key_callback(ord("B"),
+            vis.register_key_callback(ord("B"), toggle_backface)
+            vis.register_key_callback(ord("G"), toggle_guides)
+            vis.register_key_callback(ord("S"), save_screenshot)
+            vis.register_key_callback(ord("R"), reset_camera)
+
+            vis.run()
+            vis.destroy_window()
+
+        except Exception as exc:
+            logger.warning("Terjadi kendala pada jendela Open3D Visualizer: %s", exc)
+            return True
+
+        if preview_cfg.confirm_before_export:
+            try:
+                ans = input(
+                    f"Lanjutkan ekspor file 3D untuk '{report.model_name}' ke disk? [Y/n]: "
+                ).strip().lower()
+                if ans in ("n", "no", "tidak"):
+                    logger.warning("Ekspor file untuk '%s' dibatalkan oleh pengguna.", report.model_name)
+                    return False
+            except EOFError:
+                return True
+
+        return True
+
+
+class MeshValidator:
+    """Mengaudit dimensi fisik nyata, volume, dan integritas topologi mesh."""
+
+    @staticmethod
+    def validate(
+        model_name: str,
+        mesh: trimesh.Trimesh,
+        o3d_mesh: o3d.geometry.TriangleMesh,
+        unit: str,
+        exported_files: Optional[Dict[str, Path]] = None,
+    ) -> ValidationReport:
+        extents = mesh.extents
+        is_wt = bool(mesh.is_watertight)
+        volume = float(mesh.volume) if is_wt else None
+
+        return ValidationReport(
+            model_name=model_name,
+            unit=unit,
+            length_x=float(extents[0]),
+            width_y=float(extents[1]),
+            height_z=float(extents[2]),
+            num_vertices=int(len(mesh.vertices)),
+            num_faces=int(len(mesh.faces)),
+            surface_area=float(mesh.area),
+            volume=volume,
+            is_watertight=is_wt,
+            is_edge_manifold=bool(o3d_mesh.is_edge_manifold(allow_boundary_edges=False)),
+            is_vertex_manifold=bool(o3d_mesh.is_vertex_manifold()),
+            is_winding_consistent=bool(mesh.is_winding_consistent),
+            exported_files=exported_files or {},
+        )
+
+    @staticmethod
+    def print_report(report: ValidationReport) -> None:
+        u = report.unit
+        vol_str = f"{report.volume:,.4f} {u}^3" if report.volume is not None else "N/A (Open Surface)"
+        border = "=" * 72
+        print(f"\n{border}")
+        print(f" LAPORAN VALIDASI GEOMETRI & TOPOLOGI 3D : {report.model_name}")
+        print(border)
+        print(f"  Dimensi Fisik (P x L x T) : {report.length_x:.4f} x {report.width_y:.4f} x {report.height_z:.4f} {u}")
+        print(f"  Jumlah Vertices           : {report.num_vertices:,}")
+        print(f"  Jumlah Faces (Triangles)  : {report.num_faces:,}")
+        print(f"  Luas Permukaan Total      : {report.surface_area:,.4f} {u}^2")
+        print(f"  Volume Solid              : {vol_str}")
+        print(f"  Status Watertight (Solid) : {'YA (VALID)' if report.is_watertight else 'TIDAK (OPEN MESH)'}")
+        print(f"  Edge Manifold             : {'YA' if report.is_edge_manifold else 'TIDAK'}")
+        print(f"  Vertex Manifold           : {'YA' if report.is_vertex_manifold else 'TIDAK'}")
+        print(f"  Normal Winding Consistent : {'YA' if report.is_winding_consistent else 'TIDAK'}")
+        if report.exported_files:
+            print("-" * 72)
+            print("  File Output Terealisasi:")
+            for fmt, path in report.exported_files.items():
+                print(f"    [{fmt:<3}] -> {path.resolve()}")
+        print(f"{border}\n")
+
+
+# ==============================================================================
+# ORKESTRATOR UTAMA PIPELINE (SINGLE & MULTI-FILE)
+# ==============================================================================
+
+
+class ImageTo3DPipeline:
+    """Orkestrator end-to-end yang menghubungkan seluruh tahapan presisi."""
+
+    def __init__(self, config: PipelineConfig) -> None:
+        self.cfg = config
+        self.preprocessor = ImagePreprocessor(config)
+        self.cad_reconstructor = CadOrthographicReconstructor(config)
+        self.surface_reconstructor = SurfaceReliefReconstructor(config)
+        self.optimizer = MeshTopologyOptimizer(config)
+        self.exporter = MultiFormatMeshExporter(config)
+
+    def run(self) -> List[ValidationReport]:
+        reports: List[ValidationReport] = []
+        files = self.cfg.input_paths
+
+        if self.cfg.multi_strategy == "batch" or len(files) == 1:
+            for img_path in files:
+                logger.info("Memproses file tunggal: %s (Mode: %s)", img_path.name, self.cfg.mode.upper())
+                raw_mesh = self._process_single_file(img_path, z_offset=0.0)
+                report = self._finalize_and_export(raw_mesh, img_path.stem)
+                reports.append(report)
+
+        elif self.cfg.multi_strategy == "stack" and self.cfg.mode == "cad":
+            logger.info("Memproses %d file dalam mode STACKED CAD LAYERS...", len(files))
+            stacked_meshes: List[trimesh.Trimesh] = []
+            current_z = 0.0
+            step_z = self.cfg.calibration.extrude_height + self.cfg.layer_gap
+
+            for idx, img_path in enumerate(files):
+                logger.info("  Layer %d/%d: %s (Z=%.3f)", idx + 1, len(files), img_path.name, current_z)
+                layer_mesh = self._process_single_file(img_path, z_offset=current_z)
+                stacked_meshes.append(layer_mesh)
+                current_z += step_z
+
+            merged_stack = trimesh.util.concatenate(stacked_meshes)
+            report = self._finalize_and_export(merged_stack, "stacked_cad_assembly")
+            reports.append(report)
+
+        elif self.cfg.multi_strategy == "merge" and self.cfg.mode == "surface":
+            logger.info("Memproses %d file dalam mode MULTI-VIEW POINT CLOUD MERGE...", len(files))
+            combined_pcd = o3d.geometry.PointCloud()
+            voxel_size = self.cfg.calibration.scale_per_pixel * 1.5
+
+            for idx, img_path in enumerate(files):
+                img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
+                denoised = self.preprocessor.enhance_and_denoise(img_bgr)
+                pcd, _, _ = self.surface_reconstructor.build_calibrated_point_cloud(img_rgb, denoised)
+
+                if idx > 0 and len(combined_pcd.points) > 0:
+                    reg = o3d.pipelines.registration.registration_icp(
+                        pcd,
+                        combined_pcd,
+                        max_correspondence_distance=voxel_size * 5.0,
+                        init=np.eye(4),
+                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    )
+                    pcd.transform(reg.transformation)
+                combined_pcd += pcd
+
+            combined_pcd = combined_pcd.voxel_down_sample(voxel_size=voxel_size)
+            raw_mesh = self.surface_reconstructor.reconstruct_from_point_cloud(combined_pcd)
+            report = self._finalize_and_export(raw_mesh, "merged_surface_model")
+            reports.append(report)
+        else:
+            raise PipelineError(
+                f"Kombinasi mode='{self.cfg.mode}' dan multi_strategy='{self.cfg.multi_strategy}' tidak didukung."
+            )
+
+        return reports
+
+    def _process_single_file(self, img_path: Path, z_offset: float) -> trimesh.Trimesh:
+        img_bgr, img_rgb = self.preprocessor.load_and_rectify_image(img_path)
+        denoised_gray = self.preprocessor.enhance_and_denoise(img_bgr)
+
+        if self.cfg.mode == "cad":
+            denoised_bgr = self.preprocessor.enhance_color_preserve_edges(img_bgr)
+            binary = self.preprocessor.binarize_high_precision(denoised_gray)
+            return self.cad_reconstructor.reconstruct(
+                binary_mask=binary,
+                denoised_gray=denoised_gray,
+                denoised_bgr=denoised_bgr,
+                img_rgb=img_rgb,
+                z_offset=z_offset,
+            )
+        else:
+            pcd, z_grid, rgb_grid = self.surface_reconstructor.build_calibrated_point_cloud(
+                img_rgb=img_rgb,
+                denoised_gray=denoised_gray,
+            )
+            eff_scale = self.cfg.calibration.scale_per_pixel * (
+                img_rgb.shape[1] / float(z_grid.shape[1])
+            )
+            mesh = self.surface_reconstructor.reconstruct_from_point_cloud(
+                pcd=pcd,
+                z_grid=z_grid,
+                rgb_grid=rgb_grid,
+                eff_scale=eff_scale,
+            )
+            if z_offset != 0.0:
+                mesh.apply_translation([0.0, 0.0, z_offset])
+            return mesh
+
+    def _finalize_and_export(self, raw_mesh: trimesh.Trimesh, base_name: str) -> ValidationReport:
+        clean_tm, clean_o3d = self.optimizer.clean_and_optimize(raw_mesh)
+
+        report = MeshValidator.validate(
+            model_name=base_name,
+            mesh=clean_tm,
+            o3d_mesh=clean_o3d,
+            unit=self.cfg.calibration.unit,
+        )
+
+        if self.cfg.preview.enabled and self.cfg.preview.confirm_before_export:
+            MeshValidator.print_report(report)
+            approved = InteractiveMeshPreviewer.show(
+                o3d_mesh=clean_o3d,
+                report=report,
+                preview_cfg=self.cfg.preview,
+                output_dir=self.cfg.output_dir,
+            )
+            if not approved:
+                return report
+
+        exported_files = self.exporter.export_all(clean_tm, clean_o3d, base_name)
+        report.exported_files = exported_files
+        MeshValidator.print_report(report)
+
+        if self.cfg.preview.enabled and not self.cfg.preview.confirm_before_export:
+            InteractiveMeshPreviewer.show(
+                o3d_mesh=clean_o3d,
+                report=report,
+                preview_cfg=self.cfg.preview,
+                output_dir=self.cfg.output_dir,
+            )
+
+        return report
+
+
+# ==============================================================================
+# PARSING & ANTARMUKA CLI (--help TERSTRUKTUR)
+# ==============================================================================
+
+
+class SmartHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Formatter CLI yang mempertahankan format multi-baris sekaligus menampilkan nilai default."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, indent_increment=2, max_help_position=38, width=104)
+
+
+def resolve_input_files(raw_inputs: Sequence[str]) -> List[Path]:
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    resolved: List[Path] = []
+
+    for item in raw_inputs:
+        p = Path(item)
+        if p.is_dir():
+            for child in sorted(p.iterdir()):
+                if child.suffix.lower() in valid_exts:
+                    resolved.append(child)
+        elif "*" in item or "?" in item:
+            for match in sorted(glob.glob(item)):
+                mp = Path(match)
+                if mp.is_file() and mp.suffix.lower() in valid_exts:
+                    resolved.append(mp)
+        elif p.is_file():
+            resolved.append(p)
+        else:
+            raise FileNotFoundError(f"Input tidak ditemukan: {item}")
+
+    if not resolved:
+        raise FileNotFoundError("Tidak ada file gambar valid (JPG/PNG) yang ditemukan.")
+    return resolved
+
+
+def parse_points_string(pts_str: str) -> np.ndarray:
+    pairs = [seg.strip() for seg in pts_str.split(";") if seg.strip()]
+    if len(pairs) != 4:
+        raise CalibrationError(
+            f"--homography-points harus berisi tepat 4 titik dipisah ';' (ditemukan: {len(pairs)})."
+        )
+    coords: List[Tuple[float, float]] = []
+    for pair in pairs:
+        xy = pair.split(",")
+        if len(xy) != 2:
+            raise CalibrationError(f"Format koordinat tidak valid: '{pair}'. Gunakan format 'x,y'.")
+        coords.append((float(xy[0]), float(xy[1])))
+    return np.array(coords, dtype=np.float32)
+
+
+def parse_wx_h(size_str: str, sep: str = "x") -> Tuple[float, float]:
+    parts = size_str.lower().split(sep)
+    if len(parts) != 2:
+        raise CalibrationError(f"Format ukuran tidak valid: '{size_str}'. Gunakan format 'WxH'.")
+    return float(parts[0]), float(parts[1])
+
+
+def parse_aruco_ids(ids_str: str) -> Tuple[int, int, int, int]:
+    parts = [p.strip() for p in ids_str.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise CalibrationError(
+            f"--aruco-ids harus berisi tepat 4 ID dipisah koma [TL,TR,BR,BL] (ditemukan: {len(parts)})."
+        )
+    return (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
+
+
+def parse_color_map_string(map_str: str) -> List[ColorLayerRule]:
+    entries = [item.strip() for item in map_str.split(",") if item.strip()]
+    if not entries:
+        raise CalibrationError("--color-map tidak boleh kosong.")
+
+    rules: List[ColorLayerRule] = []
+    for idx, entry in enumerate(entries):
+        if "=" in entry:
+            name_part, rest = entry.split("=", 1)
+            layer_name = name_part.strip()
+        else:
+            layer_name = f"ColorLayer_{idx + 1}"
+            rest = entry
+
+        if ":" not in rest:
+            raise CalibrationError(
+                f"Format aturan warna tidak valid: '{entry}'. Gunakan '#RRGGBB:tinggi' atau '#RRGGBB:z_base+tinggi'."
+            )
+        hex_part, z_spec = rest.split(":", 1)
+        rgb = hex_to_rgb(hex_part)
+
+        z_spec = z_spec.strip()
+        if "+" in z_spec:
+            base_str, height_str = z_spec.split("+", 1)
+            z_base = float(base_str)
+            height = float(height_str)
+        else:
+            z_base = 0.0
+            height = float(z_spec)
+
+        rules.append(
+            ColorLayerRule(
+                name=layer_name,
+                rgb=rgb,
+                extrude_height=height,
+                z_base=z_base,
+            )
+        )
+    return rules
+
+
+def parse_color_map_json(json_path: Path) -> List[ColorLayerRule]:
+    if not json_path.exists():
+        raise FileNotFoundError(f"File JSON color-map tidak ditemukan: {json_path}")
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or len(data) == 0:
+        raise CalibrationError("File JSON --color-map-file harus berisi array objek aturan warna.")
+
+    rules: List[ColorLayerRule] = []
+    for idx, item in enumerate(data):
+        rgb = hex_to_rgb(str(item["hex"]))
+        rules.append(
+            ColorLayerRule(
+                name=str(item.get("name", f"ColorLayer_{idx + 1}")),
+                rgb=rgb,
+                extrude_height=float(item["height"]),
+                z_base=float(item.get("z_base", 0.0)),
+            )
+        )
+    return rules
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Membangun parser CLI lengkap dengan dokumentasi --help dan contoh penggunaan."""
+    description = textwrap.dedent(
+        """\
+        ====================================================================================================
+         Img2Mesh3D Pipeline - Rekonstruksi Presisi Tinggi Citra 2D (JPG/PNG) ke Model Solid 3D (1:1)
+        ====================================================================================================
+        Mengonversi 1 atau banyak citra 2D menjadi mesh 3D watertight & manifold terkalibrasi secara
+        metrik (mendukung kalibrasi otomatis marker ArUco cv2.aruco), lalu mengekspornya ke 4 format:
+        .STL, .OBJ (+Multi-Material .MTL), .DAE (COLLADA Z-up siap SketchUp), dan .PLY (Vertex Color).
+        """
+    )
+
+    epilog = textwrap.dedent(
+        """\
+        ----------------------------------------------------------------------------------------------------
+        KONTROL INTERAKTIF SAAT --preview AKTIF (OPEN3D VISUALIZER):
+          [Mouse Kiri] Rotasi 3D       | [Scroll] Zoom             | [Shift+Drag / Tengah] Pan
+          [W] Toggle Wireframe         | [B] Toggle Back-Face      | [G] Toggle Grid Z=0 & Sumbu XYZ
+          [R] Reset Kamera             | [S] Simpan Screenshot PNG | [Q / ESC] Tutup Jendela
+
+        CONTOH PERINTAH CLI SIAP PAKAI:
+          1. Kalibrasi Otomatis ArUco 4-Sudut + Multi-Color CAD Denah (Tanpa Klik Manual):
+             python img2mesh_pipeline.py -i foto_denah_aruco.jpg -o ./out --mode cad \\
+               --aruco-board-size 210x297 --aruco-ids 0,1,2,3 --unit mm \\
+               --color-map "Dinding=#FF0000:35.0, Jendela=#0000FF:9.0" --aruco-debug --preview
+
+          2. Kalibrasi Otomatis ArUco Marker Tunggal (1 Marker Persegi di Samping Objek):
+             python img2mesh_pipeline.py -i foto_komponen.jpg -o ./out --mode cad \\
+               --aruco-marker-size 50.0 --unit mm --extrude-height 12.0 --preview
+
+          3. Cetak Lembar Referensi ArUco 4-Sudut (Ukuran A4 = 210x297 mm):
+             python img2mesh_pipeline.py --generate-aruco-sheet ./aruco_a4.png \\
+               --aruco-board-size 210x297 --aruco-marker-size 30 --unit mm
+
+          4. Mode A (CAD Standar) dengan Skala Manual Piksel:
+             python img2mesh_pipeline.py -i denah.png -o ./out --mode cad \\
+               --ref-real-size 6.0 --ref-pixels 1200 --unit m --extrude-height 3.5 --preview
+
+          5. Mode B (Surface / Relief) via Depth Anything V2 + ArUco Otomatis:
+             python img2mesh_pipeline.py -i relief_aruco.jpg -o ./out --mode surface \\
+               --depth-backend depth-anything --aruco-marker-size 40.0 --unit mm \\
+               --extrude-height 15.0 --preview
+        ----------------------------------------------------------------------------------------------------
+        """
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="img2mesh_pipeline.py",
+        description=description,
+        epilog=epilog,
+        formatter_class=SmartHelpFormatter,
+        add_help=False,
+    )
+
+    # --- Grup 0: Bantuan & Informasi Versi ---
+    help_group = parser.add_argument_group("0. Bantuan & Informasi Program")
+    help_group.add_argument(
+        "-h", "--help",
+        action="help",
+        default=argparse.SUPPRESS,
+        help="Tampilkan panduan lengkap parameter CLI, kontrol pratinjau 3D, dan contoh perintah",
+    )
+    help_group.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Tampilkan versi pipeline Img2Mesh3D",
+    )
+
+    # --- Grup 1: Input & Output Utama ---
+    io_group = parser.add_argument_group("1. Input, Mode Rekonstruksi & Direktori Output")
+    io_group.add_argument(
+        "-i", "--input",
+        nargs="+",
+        metavar="PATH",
+        help="Path 1 file gambar (JPG/PNG), multi-file, folder, atau pola wildcard (mis. *.png)",
+    )
+    io_group.add_argument(
+        "-o", "--output-dir",
+        type=Path,
+        default=Path("./output_3d"),
+        metavar="DIR",
+        help="Direktori penyimpanan hasil ekspor (.STL, .OBJ, .MTL, .DAE, .PLY)",
+    )
+    io_group.add_argument(
+        "-m", "--mode",
+        choices=["cad", "surface"],
+        default="cad",
+        help="Mode rekonstruksi: 'cad' (Mode A: kontur & ekstrusi) atau 'surface' (Mode B: depth/relief)",
+    )
+    io_group.add_argument(
+        "--multi-strategy",
+        choices=["batch", "stack", "merge"],
+        default="batch",
+        help="Strategi multi-file: 'batch' (terpisah), 'stack' (tumpuk layer Z Mode A), 'merge' (ICP Mode B)",
+    )
+
+    # --- Grup 2: Kalibrasi Skala Metrik ---
+    scale_group = parser.add_argument_group("2. Kalibrasi Skala Metrik (Pixel-to-Real-World)")
+    scale_group.add_argument(
+        "--ref-real-size",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Ukuran fisik referensi nyata (wajib jika tidak memakai --aruco-* atau --homography-size)",
+    )
+    scale_group.add_argument(
+        "--ref-pixels",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Panjang objek referensi dalam piksel (wajib jika tidak memakai --aruco-* atau --homography-size)",
+    )
+    scale_group.add_argument(
+        "--unit",
+        choices=["mm", "cm", "m"],
+        default="mm",
+        help="Satuan fisik model 3D akhir (disematkan juga ke metadata COLLADA .DAE SketchUp)",
+    )
+    scale_group.add_argument(
+        "--extrude-height",
+        type=float,
+        default=5.0,
+        metavar="FLOAT",
+        help="Tinggi ekstrusi Z default (Mode A) atau amplitudo relief maksimum (Mode B)",
+    )
+    scale_group.add_argument(
+        "--invert",
+        action="store_true",
+        help="Balik polaritas objek (gunakan jika objek berwarna putih/terang di atas latar gelap)",
+    )
+
+    # --- Grup 3: Kalibrasi Matriks Intrinsik Kamera ---
+    calib_group = parser.add_argument_group("3. Kalibrasi Matriks Intrinsik Kamera (Tahap 0A)")
+    calib_group.add_argument(
+        "--calibrate-chessboard",
+        nargs="+",
+        metavar="IMG",
+        help="Daftar/folder foto papan catur untuk menghitung matriks intrinsik kamera K & distorsi",
+    )
+    calib_group.add_argument(
+        "--chessboard-size",
+        type=str,
+        default="9x6",
+        metavar="CxR",
+        help="Jumlah sudut dalam papan catur (KolomxBaris)",
+    )
+    calib_group.add_argument(
+        "--square-size",
+        type=float,
+        default=25.0,
+        metavar="FLOAT",
+        help="Ukuran sisi satu kotak papan catur dalam satuan nyata",
+    )
+    calib_group.add_argument(
+        "--save-calib",
+        type=Path,
+        default=Path("./camera_intrinsics.json"),
+        metavar="JSON",
+        help="Path file JSON keluaran hasil kalibrasi kamera",
+    )
+    calib_group.add_argument(
+        "--camera-calib",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="Path file JSON kalibrasi intrinsik kamera untuk menghilangkan distorsi lensa",
+    )
+    calib_group.add_argument(
+        "--intrinsics-manual",
+        type=str,
+        default=None,
+        metavar="PARAMS",
+        help="Parameter intrinsik manual 'fx,fy,cx,cy,k1,k2,p1,p2[,k3]' jika tanpa file JSON",
+    )
+
+    # --- Grup 4A: Kalibrasi Otomatis Marker ArUco (cv2.aruco) ---
+    aruco_group = parser.add_argument_group("4A. Deteksi Otomatis Marker ArUco - Homografi & Skala 1:1 (Tahap 0B)")
+    aruco_group.add_argument(
+        "--aruco-board-size",
+        type=str,
+        default=None,
+        metavar="WxH",
+        help="Mode 4-Sudut: dimensi fisik bidang referensi 4 marker ArUco 'LebarxTinggi' (mis. 210x297)",
+    )
+    aruco_group.add_argument(
+        "--aruco-marker-size",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Mode Marker Tunggal: panjang sisi fisik S satu marker persegi ArUco dalam satuan --unit",
+    )
+    aruco_group.add_argument(
+        "--aruco-dict",
+        choices=list(SUPPORTED_ARUCO_DICTS),
+        default="DICT_4X4_50",
+        metavar="DICT",
+        help="Kamus ArUco OpenCV (mis. DICT_4X4_50, DICT_5X5_100, DICT_6X6_250, DICT_APRILTAG_36h11)",
+    )
+    aruco_group.add_argument(
+        "--aruco-ids",
+        type=str,
+        default="0,1,2,3",
+        metavar="IDs",
+        help="4 ID marker sudut referensi berurutan [TL,TR,BR,BL] untuk --aruco-board-size",
+    )
+    aruco_group.add_argument(
+        "--aruco-target-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="ID spesifik marker yang dipilih pada mode --aruco-marker-size (default: marker terbesar)",
+    )
+    aruco_group.add_argument(
+        "--aruco-anchor",
+        choices=["outer", "inner", "center"],
+        default="outer",
+        help="Titik jangkar 4 marker sudut: 'outer' (sudut luar), 'inner' (sudut dalam), 'center'",
+    )
+    aruco_group.add_argument(
+        "--aruco-debug",
+        action="store_true",
+        help="Simpan gambar overlay deteksi marker & titik homografi (*_aruco_detected.png)",
+    )
+    aruco_group.add_argument(
+        "--generate-aruco-sheet",
+        type=Path,
+        default=None,
+        metavar="PNG",
+        help="Buat file PNG lembar kalibrasi ArUco 4-sudut siap cetak lalu keluar (atau lanjut proses)",
+    )
+
+    # --- Grup 4B: Koreksi Perspektif Homografi 4-Titik Manual/Interaktif ---
+    homo_group = parser.add_argument_group("4B. Koreksi Perspektif Homografi 4-Titik Manual / Interaktif (Tahap 0B)")
+    homo_group.add_argument(
+        "--homography-points",
+        type=str,
+        default=None,
+        metavar="PTS",
+        help="4 titik sudut referensi piksel 'x1,y1;x2,y2;x3,y3;x4,y4' berurutan [TL, TR, BR, BL]",
+    )
+    homo_group.add_argument(
+        "--pick-points",
+        action="store_true",
+        help="Pilih 4 titik sudut referensi secara interaktif dengan klik mouse pada jendela gambar",
+    )
+    homo_group.add_argument(
+        "--homography-size",
+        type=str,
+        default=None,
+        metavar="WxH",
+        help="Dimensi fisik nyata bidang 4 titik 'LebarxTinggi' dalam satuan --unit (mis. 210x297)",
+    )
+    homo_group.add_argument(
+        "--homography-crop",
+        action="store_true",
+        help="Potong output hanya di dalam area 4 titik (berlaku untuk ArUco & Homografi manual)",
+    )
+
+    # --- Grup 5: Mode A (CAD & Multi-Color Layer Extrusion) ---
+    cad_group = parser.add_argument_group("5. Mode A - Presisi CAD & Multi-Color Layer Extrusion (Tahap 2A)")
+    cad_group.add_argument(
+        "--rdp-epsilon",
+        type=float,
+        default=0.35,
+        metavar="PX",
+        help="Toleransi error aproksimasi poligon Ramer-Douglas-Peucker dalam piksel",
+    )
+    cad_group.add_argument(
+        "--min-area",
+        type=float,
+        default=25.0,
+        metavar="PX2",
+        help="Luas kontur minimum dalam piksel persegi untuk menyaring bintik noise",
+    )
+    cad_group.add_argument(
+        "--layer-gap",
+        type=float,
+        default=0.0,
+        metavar="FLOAT",
+        help="Jarak celah vertikal antar layer saat menggunakan --multi-strategy stack",
+    )
+    cad_group.add_argument(
+        "--color-map",
+        type=str,
+        default=None,
+        metavar="SPEC",
+        help="Pemetaan warna HEX ke tinggi Z, mis. 'Dinding=#FF0000:3.5, Lintel=#00FFFF:2.1+1.4'",
+    )
+    cad_group.add_argument(
+        "--color-map-file",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="Path file JSON berisi daftar aturan warna [{'name','hex','z_base','height'}]",
+    )
+    cad_group.add_argument(
+        "--auto-color-layers",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Deteksi otomatis K klaster warna dominan pada denah dan ekstrusi ke tinggi Z berbeda",
+    )
+    cad_group.add_argument(
+        "--auto-heights",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help="Daftar tinggi Z untuk --auto-color-layers dipisah koma (mis. '3.5,2.1,1.0,0.3')",
+    )
+    cad_group.add_argument(
+        "--color-tolerance",
+        type=float,
+        default=22.0,
+        metavar="DE",
+        help="Toleransi jarak warna perseptual CIE Delta-E76 untuk pencocokan piksel",
+    )
+    cad_group.add_argument(
+        "--bg-threshold",
+        type=float,
+        default=15.0,
+        metavar="DE",
+        help="Ambang CIE Delta-E76 untuk memisahkan geometri berwarna dari latar belakang",
+    )
+
+    # --- Grup 6: Mode B (Surface / Relief & Depth Map) ---
+    surf_group = parser.add_argument_group("6. Mode B - Presisi Permukaan / Relief & Depth Map (Tahap 2B)")
+    surf_group.add_argument(
+        "--depth-backend",
+        choices=["heightmap", "depth-anything", "midas"],
+        default="heightmap",
+        help="Backend estimasi kedalaman: 'heightmap', 'depth-anything', atau 'midas'",
+    )
+    surf_group.add_argument(
+        "--surface-method",
+        choices=["poisson", "alpha", "grid-solid"],
+        default="poisson",
+        help="Algoritma rekonstruksi permukaan: 'poisson', 'alpha', atau 'grid-solid'",
+    )
+    surf_group.add_argument(
+        "--poisson-depth",
+        type=int,
+        default=9,
+        metavar="INT",
+        help="Kedalaman octree Screened Poisson Surface Reconstruction (8-11)",
+    )
+    surf_group.add_argument(
+        "--no-solid-base",
+        action="store_true",
+        help="Jangan tutup alas bawah Z=0 pada Mode B (menghasilkan open surface mesh)",
+    )
+
+    # --- Grup 7: Mesh Cleaning & Topology Optimization ---
+    opt_group = parser.add_argument_group("7. Pembersihan Mesh & Optimasi Topologi (Tahap 3)")
+    opt_group.add_argument(
+        "--taubin-iter",
+        type=int,
+        default=5,
+        metavar="INT",
+        help="Jumlah iterasi Taubin smoothing bebas-penyusutan volume pada Mode B",
+    )
+    opt_group.add_argument(
+        "--decimate",
+        type=float,
+        default=0.0,
+        metavar="RATIO",
+        help="Rasio reduksi segitiga (0.0 - 0.90) dengan Quadric Edge Collapse",
+    )
+
+    # --- Grup 8: Validasi & Pratinjau Interaktif Open3D ---
+    prev_group = parser.add_argument_group("8. Validasi & Pratinjau Mesh 3D Interaktif Open3D (Tahap 5)")
+    prev_group.add_argument(
+        "--preview",
+        action="store_true",
+        help="Buka jendela Open3D Visualizer interaktif pada tahap validasi akhir",
+    )
+    prev_group.add_argument(
+        "--preview-wireframe",
+        action="store_true",
+        help="Aktifkan tampilan wireframe segitiga secara default saat pratinjau dibuka",
+    )
+    prev_group.add_argument(
+        "--confirm-export",
+        action="store_true",
+        help="Tampilkan pratinjau dulu dan minta konfirmasi terminal [Y/n] sebelum menyimpan file",
+    )
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        corner_ids = parse_aruco_ids(args.aruco_ids)
+
+        # Utilitas 1: Buat Lembar Kalibrasi ArUco PNG jika diminta
+        if args.generate_aruco_sheet is not None:
+            sheet_board = (
+                parse_wx_h(args.aruco_board_size)
+                if args.aruco_board_size is not None
+                else (210.0, 297.0)
+            )
+            sheet_marker = args.aruco_marker_size if args.aruco_marker_size is not None else 30.0
+            ArucoAutoCalibrator.generate_calibration_sheet(
+                output_path=args.generate_aruco_sheet,
+                dict_name=args.aruco_dict,
+                board_size_units=sheet_board,
+                marker_size_units=sheet_marker,
+                corner_ids=corner_ids,
+                unit=args.unit,
+            )
+            if not args.input and not args.calibrate_chessboard:
+                return 0
+
+        # Utilitas 2: Kalibrasi Kamera Papan Catur
+        if args.calibrate_chessboard:
+            calib_imgs = resolve_input_files(args.calibrate_chessboard)
+            cols_f, rows_f = parse_wx_h(args.chessboard_size)
+            CameraIntrinsicsCalibrator.calibrate_from_chessboard(
+                image_paths=calib_imgs,
+                board_size=(int(cols_f), int(rows_f)),
+                square_size=args.square_size,
+                save_path=args.save_calib,
+            )
+            if not args.input:
+                return 0
+
+        if not args.input:
+            raise CalibrationError(
+                "Argumen --input wajib diisi untuk menjalankan rekonstruksi 3D. "
+                "Jalankan dengan --help untuk melihat panduan lengkap."
+            )
+
+        input_files = resolve_input_files(args.input)
+
+        intrinsics_cfg: Optional[CameraIntrinsicsConfig] = None
+        if args.camera_calib is not None:
+            intrinsics_cfg = CameraIntrinsicsConfig.from_json(args.camera_calib)
+        elif args.intrinsics_manual is not None:
+            vals = [float(v.strip()) for v in args.intrinsics_manual.split(",") if v.strip()]
+            if len(vals) < 8:
+                raise CalibrationError("--intrinsics-manual membutuhkan minimal 8 nilai: fx,fy,cx,cy,k1,k2,p1,p2[,k3].")
+            intrinsics_cfg = CameraIntrinsicsConfig.from_manual_params(
+                fx=vals[0], fy=vals[1], cx=vals[2], cy=vals[3], dist_coeffs=vals[4:]
+            )
+
+        # Konfigurasi Deteksi Otomatis ArUco (cv2.aruco)
+        aruco_cfg: Optional[ArucoConfig] = None
+        if args.aruco_board_size is not None or args.aruco_marker_size is not None:
+            board_wh = parse_wx_h(args.aruco_board_size) if args.aruco_board_size is not None else None
+            aruco_cfg = ArucoConfig(
+                dict_name=args.aruco_dict,
+                board_real_size=board_wh,
+                marker_real_size=args.aruco_marker_size,
+                corner_ids=corner_ids,
+                target_single_id=args.aruco_target_id,
+                anchor_mode=args.aruco_anchor,
+                keep_full_canvas=not args.homography_crop,
+                save_debug_overlay=args.aruco_debug,
+            )
+
+        # Konfigurasi Homografi Manual/Interaktif
+        homography_cfg: Optional[HomographyConfig] = None
+        if args.homography_points is not None or args.pick_points:
+            if args.homography_size is None:
+                raise CalibrationError("--homography-size wajib diisi saat menggunakan homografi 4-titik.")
+            h_w, h_h = parse_wx_h(args.homography_size)
+            pts = (
+                parse_points_string(args.homography_points)
+                if args.homography_points is not None
+                else np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+            )
+            homography_cfg = HomographyConfig(
+                src_points=pts,
+                rect_real_width=h_w,
+                rect_real_height=h_h,
+                keep_full_canvas=not args.homography_crop,
+            )
+
+        has_metric_rectification = (aruco_cfg is not None and aruco_cfg.is_enabled) or (
+            homography_cfg is not None
+        )
+        if has_metric_rectification:
+            calib_cfg = CalibrationConfig(
+                ref_real_size=1.0,
+                ref_pixels=1.0,
+                unit=args.unit,
+                extrude_height=args.extrude_height,
+                invert_polarity=args.invert,
+            )
+        else:
+            if args.ref_real_size is None or args.ref_pixels is None:
+                raise CalibrationError(
+                    "Isi --ref-real-size dan --ref-pixels, ATAU aktifkan kalibrasi otomatis ArUco (--aruco-board-size / --aruco-marker-size) atau homografi 4-titik."
+                )
+            calib_cfg = CalibrationConfig(
+                ref_real_size=args.ref_real_size,
+                ref_pixels=args.ref_pixels,
+                unit=args.unit,
+                extrude_height=args.extrude_height,
+                invert_polarity=args.invert,
+            )
+
+        color_rules: List[ColorLayerRule] = []
+        if args.color_map is not None:
+            color_rules.extend(parse_color_map_string(args.color_map))
+        if args.color_map_file is not None:
+            color_rules.extend(parse_color_map_json(args.color_map_file))
+
+        auto_heights: Optional[List[float]] = None
+        if args.auto_heights is not None:
+            auto_heights = [float(x.strip()) for x in args.auto_heights.split(",") if x.strip()]
+
+        color_cad_cfg = ColorCadConfig(
+            rules=color_rules,
+            auto_num_colors=args.auto_color_layers,
+            auto_heights=auto_heights,
+            delta_e_tolerance=args.color_tolerance,
+            bg_delta_e_threshold=args.bg_threshold,
+        )
+
+        preview_cfg = PreviewConfig(
+            enabled=args.preview or args.confirm_export,
+            wireframe=args.preview_wireframe,
+            confirm_before_export=args.confirm_export,
+        )
+
+        config = PipelineConfig(
+            input_paths=input_files,
+            output_dir=args.output_dir,
+            mode=args.mode,
+            multi_strategy=args.multi_strategy,
+            calibration=calib_cfg,
+            camera_intrinsics=intrinsics_cfg,
+            aruco=aruco_cfg,
+            homography=homography_cfg,
+            interactive_pick_points=args.pick_points,
+            rdp_epsilon_px=args.rdp_epsilon,
+            min_contour_area_px=args.min_area,
+            layer_gap=args.layer_gap,
+            color_cad=color_cad_cfg,
+            depth_backend=args.depth_backend,
+            surface_method=args.surface_method,
+            poisson_depth=args.poisson_depth,
+            close_solid_base=not args.no_solid_base,
+            taubin_iterations=args.taubin_iter,
+            target_reduction=args.decimate,
+            preview=preview_cfg,
+        )
+
+        pipeline = ImageTo3DPipeline(config)
+        pipeline.run()
+        return 0
+
+    except PipelineError as exc:
+        logger.error("Kesalahan Pipeline Geometri: %s", exc)
+        return 1
+    except FileNotFoundError as exc:
+        logger.error("Kesalahan Berkas Input: %s", exc)
+        return 2
+    except KeyboardInterrupt:
+        logger.warning("Proses dibatalkan oleh pengguna.")
+        return 130
+    except Exception as exc:
+        logger.exception("Kesalahan tak terduga: %s", exc)
+        return 99
+
+
+if __name__ == "__main__":
+    sys.exit(main())
